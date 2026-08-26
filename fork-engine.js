@@ -165,6 +165,35 @@ const BRAKE_HOLD = 3.0;            // s it must hold before the gate opens
    reference precise enough — which is why finalVerdict(), which legally
    knows it, is the accurate path and the live one is not.
 
+   KURTOSIS, not skew, is the right statistic in this frame — and it also
+   failed. Carrying |a|-skew into the junction-anchored frame because it
+   won in the arrival-anchored one was a mistake; re-scanning within the
+   frame found kurtosis of |a| over [det-10, det] at LOOCV 96%, p=0.0002
+   best-of-scan over 144 features. It passed every check that exposed an
+   earlier 96% as an orientation leak: labels interleaved in time (runs
+   z=+1.64), chronological split 100%, same-evening trips 8 and 10 minutes
+   apart tracking the platform not the session, an 88-96% plateau over
+   neighbouring windows, and — the strongest evidence the anchor is real —
+   windows that CONTAIN the detection scoring 88-96% while windows shifted
+   off it collapse to 0-50%. Offline it gave 73/69/81/92/96/96/96/96% at
+   arrival-30/24/20/16/12/8/4/0 s with 0.12 flips: never silent,
+   monotonically improving, no dip at the stop. Everything the live path
+   is supposed to do.
+
+   Streamed through this class it gave 57-85%, with the arrival-4 s dip
+   still present. Two implementations were tried: differencing raw ~60 Hz
+   samples (85% at arrival-12 s) and binning to 20 Hz first to match the
+   analysis exactly (65%). Neither reproduced 96%.
+
+   THE REAL LESSON, and the reason this is recorded at length: |d|a|/dt|
+   is strongly sample-rate dependent, so the detector's argmax moves with
+   the preprocessing chain, and a feature anchored on it inherits that
+   fragility. A 96% that survives only one exact chain is not a 96%. By
+   contrast the arrival-anchored SKEW_FINAL window reproduced 25/26 in
+   this class on the first attempt, from a completely independent Python
+   implementation. That robustness is itself evidence, and is why skew
+   ships and kurtosis does not.
+
    The lesson is the one this file already records elsewhere: an offline
    window and a causal detector for the same event are different
    measurements, and only the streamed number counts.

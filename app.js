@@ -614,13 +614,18 @@ async function loadMLModules() {
         ui.forecastNote.textContent =
           forkOut.phase === "final"
             ? "arrival detected — fork reading"
-            : "approach — provisional fork reading";
+            : "braking — provisional reading";
         return;
       }
       // Before the route prior arms (first ~75 s) there is no fork evidence
       // yet; show the waiting state rather than a meaningless number.
+      // v2 also waits for braking: the trailing skew reading is inverted
+      // (31% correct) before the train starts slowing, so a number shown
+      // then is worse than no number at all.
       if (forkOut && forkOut.phase === "waiting") {
-        ui.forecastNote.textContent = "waiting for the approach…";
+        ui.forecastNote.textContent = forkOut.armed
+          ? "approach — waiting for braking…"
+          : "waiting for the approach…";
         return;
       }
 

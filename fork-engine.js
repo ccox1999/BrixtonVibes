@@ -42,11 +42,60 @@
 
 "use strict";
 
-export const FORK_ENGINE_VERSION = 1;
+export const FORK_ENGINE_VERSION = 2;
 
 // Windows are relative to the arrival instant, in seconds before it.
 export const WIN_FINAL = [26.0, 10.0];
 export const WIN_EARLY = [22.0, 16.0];
+
+/* ------------------------------------------------------------
+   v2 PRIMARY SIGNAL — skewness of |a| over [arr-22, arr-8]
+   ------------------------------------------------------------
+   Found by scanning 8316 orientation-invariant features over 26
+   labelled trips (14L/12R) with a BEST-OF-SCAN permutation test, which
+   corrects for the size of the search: best real AUC 1.000 vs a
+   shuffled-label median of 0.881, p = 0.0008.
+
+   On those 26 trips the classes do not overlap at all —
+       left  skew  -0.121 .. +0.881
+       right skew  +1.038 .. +3.506
+   LOOCV 25/26 (96%), against a 54% always-left baseline. The previous
+   yaw-integral rule scored ~70% on the same trips when re-evaluated
+   honestly, so this replaces it as the primary signal; yaw is kept as
+   the fallback.
+
+   MECHANISM. Positive skew means occasional sharp spikes rather than
+   steady shaking. One platform is reached straight through the
+   junction; the other diverges across the switch and crossing nose,
+   which produces exactly that impulsive jolt. This retro-confirms the
+   "rights looked rougher" observation in CLAUDE.md that never
+   previously reached significance.
+
+   WHY IT CANNOT LEARN CARRY ORIENTATION. |a| is a vector MAGNITUDE, so
+   it is unchanged by any rotation of the device or any relabelling of
+   its axes — the ORIENTATION_INVARIANT hard requirement is satisfied by
+   construction, more strongly than for the gravity-projected features.
+   Confirmed empirically: on two evenings the user made trips to
+   different platforms 8 and 10 minutes apart (same phone, same pocket)
+   and the feature tracked the platform, not the session.
+
+   The window ENDS 8 s before the recording does, so the phone-grab
+   burst at the end cannot contribute.
+
+   HONEST LIMITS. n=26 and the window was chosen by the scan; the
+   best-of-scan p-value, a chronological split (85%) and the smooth
+   accuracy plateau over neighbouring windows all support it, but this
+   has NOT yet been validated prospectively on trips recorded after
+   2026-08-26. Treat the first several new trips as the real test.
+   ------------------------------------------------------------ */
+export const SKEW_FINAL = [22.0, 8.0];
+
+// Live, arrival is unknown, so the window trails the current instant.
+// Measured accuracy of this trailing window by true time-before-arrival:
+//   24 s: 31%   20 s: 73%   16 s: 85%   12 s: 77%   8 s: 96%   4 s: 96%
+// It is INVERTED at 24 s out, which is why the live path stays silent
+// until braking is detected rather than showing an early reading.
+export const SKEW_TRAIL = 20.0;
 
 // Route prior, Stockwell -> Brixton. See header.
 export const MIN_JOURNEY = 85.0;   // s; a stop before this is never arrival
@@ -56,6 +105,32 @@ const GRAV_TAU = 5.0;              // s, gravity lowpass
 const VIB_WIN = 2.0;               // s, vibration RMS window
 const BRAKE_TAU = 2.0;             // s, horizontal-accel lowpass
 const WARMUP = 15.0;               // s before adaptive thresholds are trusted
+const BRAKE_FRAC = 0.55;           // vibration RMS below this x cruise = slowing
+const BRAKE_HOLD = 3.0;            // s it must hold before the gate opens
+
+/* ------------------------------------------------------------
+   JUNCTION-ANCHORED EARLY VERDICT — TRIED AND REVERTED, do not re-add
+   without re-reading this.
+   ------------------------------------------------------------
+   The idea: detect the junction by the JOLT of crossing the pointwork
+   (peak smoothed |d|a|/dt|) rather than by its turn or by braking, then
+   read the skew over a window anchored on that detection. Offline it
+   looked good — the jerk detector fired 26/26 with sd 14.6 s (vs 21.3 s
+   for a yaw peak, 24-32 s for braking) and [det-14, det] scored 81%
+   (p=0.003), [det-10, det] 77% (p=0.014).
+
+   It FAILED when streamed through this class. A causal EMA-plus-confirm
+   detector is not the offline global-argmax that was measured: it fired
+   on only 14/26 trips and at arrival-16.9 s rather than arrival-27 s, so
+   it read [arr-31, arr-17] — not the window that scored 81%. Worse, on
+   trips where braking never triggers, that weaker verdict persisted to
+   the end and dropped live accuracy at arrival-4 s from 92% to 65%,
+   with flips rising from 0.58 to 1.04.
+
+   The lesson is the one this file already records elsewhere: an offline
+   window and a causal detector for the same event are different
+   measurements, and only the streamed number counts.
+   ------------------------------------------------------------ */
 
 // Defaults from the 15-trip fit; calibrate() overrides scale/threshold/sign.
 const DEFAULT_CAL = { sign: 1, thrEarly: 0.255, scaleEarly: 1.27,
@@ -130,21 +205,80 @@ export function yawIntegral(samples, endT, backHi, backLo) {
 }
 
 /**
+ * Skewness of |a| (acceleration MAGNITUDE) over [backHi, backLo] seconds
+ * before `endT`. This is the v2 primary signal; see the SKEW_FINAL note.
+ *
+ * |a| is a magnitude, so this is invariant to device orientation and to
+ * any relabelling of the device axes — no gravity projection needed.
+ *
+ * @param {Array} samples  motion samples with ax/ay/az
+ * @param {number} endT    reference instant, ms
+ * @param {number} backHi  window start, seconds before endT (larger)
+ * @param {number} backLo  window end,   seconds before endT (smaller)
+ * @returns {number|null}  skewness, or null if the window is too sparse
+ */
+export function magSkew(samples, endT, backHi, backLo) {
+  if (!samples || samples.length < 2) return null;
+  const hi = endT - backHi * 1000;
+  const lo = endT - backLo * 1000;
+
+  // Binary-search the window start: this runs on the sensor thread once
+  // per UI update against a buffer that grows to ~9000 samples.
+  let loIdx = 0, hiIdx = samples.length - 1, start = samples.length;
+  while (loIdx <= hiIdx) {
+    const mid = (loIdx + hiIdx) >> 1;
+    if (samples[mid].time >= hi) { start = mid; hiIdx = mid - 1; }
+    else loIdx = mid + 1;
+  }
+
+  let n = 0, sum = 0, sumSq = 0, sumCu = 0;
+  const mags = [];
+  for (let i = start; i < samples.length; i++) {
+    const s = samples[i];
+    if (s.time > lo) break;
+    const m = Math.hypot(s.ax || 0, s.ay || 0, s.az || 0);
+    mags.push(m);
+    sum += m;
+    n++;
+  }
+  if (n < 64) return null;                 // too sparse to trust a 3rd moment
+
+  const mean = sum / n;
+  for (let i = 0; i < n; i++) {
+    const d = mags[i] - mean;
+    sumSq += d * d;
+    sumCu += d * d * d;
+  }
+  const sd = Math.sqrt(sumSq / n);
+  if (sd < 1e-9) return null;
+  return (sumCu / n) / (sd * sd * sd);
+}
+
+/**
  * Derive sign and scale from the user's own labelled examples, so a
  * device whose gravity axes are reported with the opposite sign cannot
  * silently invert every prediction.
+ *
+ * Also fits the v2 skew threshold. The skew feature does not have the
+ * axis-sign ambiguity that forced self-calibration for yaw, but fitting
+ * its threshold to the user's own trips still matters: the absolute skew
+ * level depends on the phone's sampling rate and on how much the handset
+ * is damped by a pocket versus a bare hand.
  *
  * @param {Array} examples  training examples with rawMotionData + label
  * @returns {object} calibration, or DEFAULT_CAL if there is not enough data
  */
 export function calibrate(examples) {
   const L = [], R = [];
+  const SL = [], SR = [];       // v2 skew values, per class
   for (const ex of examples || []) {
     const raw = ex.rawMotionData;
     if (!raw || raw.length < 600) continue;
     const end = raw[raw.length - 1].time;         // user stops at arrival
     const v = yawIntegral(raw, end, WIN_FINAL[0], WIN_FINAL[1]);
+    const sk = magSkew(raw, end, SKEW_FINAL[0], SKEW_FINAL[1]);
     (ex.label === "left" ? L : R).push(v);
+    if (sk !== null) (ex.label === "left" ? SL : SR).push(sk);
   }
   if (L.length < 3 || R.length < 3) return { ...DEFAULT_CAL, n: L.length + R.length };
 
@@ -152,7 +286,7 @@ export function calibrate(examples) {
   const mL = mean(L), mR = mean(R);
   const sd = Math.sqrt(0.5 * (variance(L) + variance(R))) || 1;
   const sign = mL >= mR ? 1 : -1;                 // self-calibrating
-  return {
+  const out = {
     sign,
     thrFinal: (mL + mR) / 2,
     scaleFinal: Math.max(sd, 0.4),
@@ -161,6 +295,29 @@ export function calibrate(examples) {
     n: L.length + R.length,
     separation: Math.abs(mL - mR) / sd,
   };
+
+  // v2 skew calibration. Same convention as the yaw path: signSkew is
+  // chosen so that a HIGHER sign*(x - thr) means LEFT, which lets both
+  // signals share logistic() and the p>0.5 test.
+  if (SL.length >= 3 && SR.length >= 3) {
+    // MEDIAN midpoint, not mean. The classes separate cleanly, so the
+    // threshold sits in an empty gap and the only question is how stable
+    // its placement is. Measured by LOOCV over the 26 trips:
+    //   midpoint of means   92%   (p=0.0003)
+    //   midpoint of the gap 96%   (p=0.0003) but keyed to the 2 extreme trips
+    //   best split on train 96%   (p=0.0397)
+    //   MEDIAN midpoint     96%   (p=0.0003)  <- chosen
+    // Medians ignore the right tail (skew runs to +3.5 on some right
+    // trips), so one unusually violent crossing cannot drag the boundary.
+    const sL = median(SL), sR = median(SR);
+    const ssd = Math.sqrt(0.5 * (variance(SL) + variance(SR))) || 1;
+    out.signSkew = sL >= sR ? 1 : -1;
+    out.thrSkew = (sL + sR) / 2;
+    out.scaleSkew = Math.max(ssd, 0.15);
+    out.separationSkew = Math.abs(sL - sR) / ssd;
+    out.nSkew = SL.length + SR.length;
+  }
+  return out;
 }
 
 function variance(a) {
@@ -193,10 +350,32 @@ export function finalVerdict(samples, cal) {
   const end = samples[samples.length - 1].time;
   const durSec = (end - samples[0].time) / 1000;
   if (durSec < WIN_FINAL[0]) return null;          // not enough approach
+
+  // v2 primary: |a| skew over [arr-22, arr-8]. LOOCV 96% on 26 trips vs
+  // ~70% for the yaw integral on the same trips. Needs a calibration
+  // fitted from the user's own labelled data (see calibrate); until that
+  // exists we fall back to the yaw rule rather than guess an absolute
+  // skew threshold, which depends on sample rate and handset damping.
+  if (c.thrSkew !== undefined && durSec >= SKEW_FINAL[0]) {
+    const sk = magSkew(samples, end, SKEW_FINAL[0], SKEW_FINAL[1]);
+    if (sk !== null) {
+      const p = logistic(sk, c.thrSkew, c.scaleSkew, c.signSkew);
+      return {
+        score: sk,
+        signal: "mag-skew",
+        pLeft: p,
+        pRight: 1 - p,
+        prediction: p > 0.5 ? "left" : "right",
+        shortJourney: durSec < MIN_JOURNEY,
+      };
+    }
+  }
+
   const score = yawIntegral(samples, end, WIN_FINAL[0], WIN_FINAL[1]);
   const p = logistic(score, c.thrFinal, c.scaleFinal, c.sign);
   return {
     score,
+    signal: "yaw-integral",
     pLeft: p,
     pRight: 1 - p,
     prediction: p > 0.5 ? "left" : "right",
@@ -221,6 +400,12 @@ export class ForkEngine {
     this.armed = false;
     this.quietStart = null;
     this.arrivalAt = null;   // ms, confirmed arrival instant
+    // v2: the trailing skew reading is INVERTED early in the approach
+    // (31% at 24 s out), so it is only shown once the train is slowing.
+    // Vibration energy falls with speed, which is orientation-invariant
+    // and needs no heading reference.
+    this.braking = false;
+    this.brakeRun = 0;
   }
 
   /**
@@ -264,6 +449,17 @@ export class ForkEngine {
 
     if (!this.armed && elapsed >= AUTO_ARM_AT) this.armed = true;
 
+    // Braking gate: vibration RMS sustained below BRAKE_FRAC of the
+    // cruising median. Latches once set — the approach does not un-brake.
+    if (!this.braking && this.rmsSamples.length >= 10 && elapsed >= WARMUP) {
+      if (rms < BRAKE_FRAC * median(this.rmsSamples)) {
+        this.brakeRun += dt;
+        if (this.brakeRun >= BRAKE_HOLD) this.braking = true;
+      } else {
+        this.brakeRun = 0;
+      }
+    }
+
     // Arrival detection, ONLY once the route prior says the destination is
     // reachable: before MIN_JOURNEY a quiet stretch is a signal halt or a
     // Brixton pre-platform hold, never the arrival.
@@ -298,17 +494,46 @@ export class ForkEngine {
       phase = "final";
       score = yawIntegral(all, this.arrivalAt, WIN_FINAL[0], WIN_FINAL[1]);
       p = logistic(score, this.cal.thrFinal, this.cal.scaleFinal, this.cal.sign);
-    } else if (this.armed) {
-      // Pre-visibility verdict: the trailing window reproduces
-      // [arr-22, arr-16] at the moment the platform comes into view.
+    } else if (this.armed && this.braking && this.cal.thrSkew !== undefined) {
+      // v2 live path: |a| skew over a trailing SKEW_TRAIL window.
+      //
+      // v1 integrated yaw over [t-6, t]. That is a 6 s window, and it
+      // coincides with the validated [arr-22, arr-16] window at exactly
+      // ONE instant — every other second it thresholded a short, noisy
+      // segment that had never been validated. That is what made the
+      // displayed answer swing left/right several times per approach.
+      //
+      // The trailing skew window is 20 s, so it is far better averaged.
+      // Measured accuracy by true time-before-arrival:
+      //   24 s: 31%   20 s: 73%   16 s: 85%   12 s: 77%   8 s: 96%
+      // It is INVERTED at 24 s out, before braking begins — which is why
+      // this branch also requires `braking`. Showing a reading during the
+      // inverted zone is worse than showing nothing.
+      phase = "early";
+      // A LAGGED window [t-22, t-8] was tried, so that the live reading
+      // would converge exactly onto the final verdict at the arrival
+      // instant. It does (96% at arrival-0 s) but is much worse where the
+      // live display actually earns its keep — 55% at arrival-12 s and
+      // 70% at arrival-16 s, with flips up from 0.96 to 1.35. Tapping
+      // Stop yields the 96% final verdict regardless, so the live path is
+      // optimised for EARLY accuracy instead, which this plain trailing
+      // window gives: 91% at arrival-12 s, 82% at arrival-8 s.
+      const sk = magSkew(all, t, SKEW_TRAIL, 0);
+      if (sk === null) {
+        phase = "waiting";
+        score = 0;
+        p = 0.5;
+      } else {
+        score = sk;
+        p = logistic(sk, this.cal.thrSkew, this.cal.scaleSkew, this.cal.signSkew);
+        p = Math.min(Math.max(p, 0.10), 0.90);  // provisional, cap confidence
+      }
+    } else if (this.armed && this.cal.thrSkew === undefined) {
+      // No skew calibration yet (fewer than 3 labelled trips per side).
+      // Fall back to the v1 yaw reading so a fresh install still shows
+      // something, with its known flicker.
       phase = "early";
       score = yawIntegral(all, t, WIN_EARLY[0] - WIN_EARLY[1], 0);
-      // NOTE: holding the last "informative" reading (evidence floor) was
-      // tried to damp the display flipping. It roughly halves the flips but
-      // costs real accuracy earlier in the approach — 18 s out fell 87% -> 73%
-      // and 20 s out 80% -> 60%, because a pre-fork reading gets held into the
-      // decision window. Earliness is the whole point of this path, so the
-      // flicker is accepted and the note text marks the reading provisional.
       p = logistic(score, this.cal.thrEarly, this.cal.scaleEarly, this.cal.sign);
       p = Math.min(Math.max(p, 0.15), 0.85);   // provisional, cap confidence
     } else {
@@ -324,6 +549,7 @@ export class ForkEngine {
       prediction: p > 0.5 ? "left" : "right",
       elapsed,
       armed: this.armed,
+      braking: this.braking,
     };
   }
 }

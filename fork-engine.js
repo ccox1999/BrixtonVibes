@@ -146,6 +146,25 @@ const BRAKE_HOLD = 3.0;            // s it must hold before the gate opens
    the end and dropped live accuracy at arrival-4 s from 92% to 65%,
    with flips rising from 0.58 to 1.04.
 
+   AND THE 77-81% ITSELF WAS AN ARTEFACT. It came from smoothing the jerk
+   with a CENTRED boxcar (np.convolve mode='same'), which reads samples
+   from the future. Redone with a trailing filter — the only kind this
+   class can compute — the detector's scatter goes from sd 14.6 s to
+   24-28 s and the accuracy at [det-10, det] falls to:
+       argmax deferred to braking      65%  p=0.20
+       argmax deferred to braking+10s  65%  p=0.18
+       argmax over the whole recording 73%  p=0.05
+   Five detector variants were tried in all (yaw peak 62%, braking onset
+   23%, jerk EMA+turnover, jerk onset, deferred argmax 65-73%). None
+   approaches the 96% of the arrival-anchored SKEW_FINAL window.
+
+   Root cause, which is worth remembering: the junction is DETECTABLE but
+   not LOCALISABLE. Every causal detector finds an event on every trip
+   and places it within a +/-24 s band, and a window anchored that
+   loosely cannot line up across trips. The arrival instant is the only
+   reference precise enough — which is why finalVerdict(), which legally
+   knows it, is the accurate path and the live one is not.
+
    The lesson is the one this file already records elsewhere: an offline
    window and a causal detector for the same event are different
    measurements, and only the streamed number counts.

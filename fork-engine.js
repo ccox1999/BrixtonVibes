@@ -116,6 +116,62 @@ export const SKEW_FINAL = [22.0, 8.0];
 // they lock in the inverted early readings. See the P_SMOOTH note below.
 export const SKEW_TRAIL = 20.0;
 
+/* ------------------------------------------------------------
+   v3 LIVE PATH — junction-anchored kurtosis. THE PRIMARY SIGNAL.
+   ------------------------------------------------------------
+   THE OBJECTIVE IS EARLY PREDICTION. The user does not want an accurate
+   answer once Stop is pressed; by then the platform is visible and the
+   answer is worthless. Only a reading available WELL BEFORE arrival
+   counts, which means SILENCE IS A FAILURE, not an abstention.
+
+   Scored that way — correct out of ALL 26 trips, a trip with no reading
+   yet counting as wrong — the arrival-anchored trailing window is poor,
+   because it waits for braking and is still silent on most trips when it
+   matters:
+       arrival-16 s   8 correct, 16 silent  -> 31%
+       arrival-12 s  10 correct, 15 silent  -> 38%
+       arrival-8 s   14 correct,  9 silent  -> 54%
+   Its headline "91% at arrival-12 s" was computed only over the 11 trips
+   where it had anything to say.
+
+   Anchoring on the junction instead removes the wait entirely. Detect the
+   crossing, read a window ending at it, and how long the train then takes
+   to reach the platform stops mattering — which is the point, because
+   that duration varies hugely (Brixton holds trains for the platform to
+   clear) and is what forced the braking gate in the first place.
+
+   DETECTOR: argmax of trailing-smoothed |d|a|/dt| over [JUNCTION_ARM, now].
+   Causal at every instant; it settles on its final position by
+   arrival-43 s on all 26 trips.
+   FEATURE: kurtosis of |a| over [det-10, det]  (WIN_JUNCTION).
+
+   Skew was tried here first, purely because it won in the
+   arrival-anchored frame, and scores only 65-73%. Kurtosis — peakedness,
+   i.e. heavy tails — is the right description of an impulsive jolt.
+
+   VERIFICATION (the checks that exposed an earlier 96% as an orientation
+   leak): labels well interleaved in time (runs z=+1.64); chronological
+   split 100%; trips 8 and 10 minutes apart on the same evening track the
+   platform, not the session (21 Jul R 8.9 / L 3.2 / R 10.4; 19 Aug
+   R 11.4 / L 3.5); neighbouring windows 88-96%; and windows shifted OFF
+   the detection collapse to 0-50% while those containing it hold 88-96%
+   — direct evidence the anchor is real. Best-of-scan p=0.0002 over 144
+   features, so the size of the search is paid for.
+
+   HONEST LIMITS. Offline this scored 96% from arrival-12 s; streamed
+   through this class it is 81-85%. |d|a|/dt| is sample-rate dependent, so
+   the detector's argmax shifts with the preprocessing chain and the
+   offline figure does not transfer — binning to 20 Hz to match the
+   analysis made it worse (65%), not better. 81-85% ON EVERY TRIP is
+   nevertheless far better against the actual objective than 91% on 40% of
+   them. The classes also overlap slightly here (left tops at 6.56, right
+   starts at 5.94), unlike the cleanly separated skew feature, and none of
+   this is validated prospectively.
+   ------------------------------------------------------------ */
+export const JUNCTION_ARM = 45.0;   // s; detection may look from here
+export const JERK_SMOOTH = 3.0;     // s, trailing mean on |d|a|/dt|
+export const WIN_JUNCTION = [10.0, 0.0];   // kurtosis window, rel. to detection
+
 // Route prior, Stockwell -> Brixton. See header.
 export const MIN_JOURNEY = 85.0;   // s; a stop before this is never arrival
 export const AUTO_ARM_AT = 75.0;   // s; final approach becomes plausible
@@ -322,6 +378,106 @@ export function magSkew(samples, endT, backHi, backLo) {
 }
 
 /**
+ * Kurtosis of |a| over [backHi, backLo] seconds before `endT`.
+ * The v3 live signal; see the WIN_JUNCTION note. Like magSkew this uses a
+ * vector MAGNITUDE, so it is invariant to device orientation and to any
+ * relabelling of the axes.
+ *
+ * @returns {number|null} kurtosis, or null if the window is too sparse
+ */
+export function magKurtosis(samples, endT, backHi, backLo) {
+  if (!samples || samples.length < 2) return null;
+  const hi = endT - backHi * 1000;
+  const lo = endT - backLo * 1000;
+
+  let loIdx = 0, hiIdx = samples.length - 1, start = samples.length;
+  while (loIdx <= hiIdx) {
+    const mid = (loIdx + hiIdx) >> 1;
+    if (samples[mid].time >= hi) { start = mid; hiIdx = mid - 1; }
+    else loIdx = mid + 1;
+  }
+
+  const mags = [];
+  let sum = 0;
+  for (let i = start; i < samples.length; i++) {
+    const s = samples[i];
+    if (s.time > lo) break;
+    const m = Math.hypot(s.ax || 0, s.ay || 0, s.az || 0);
+    mags.push(m);
+    sum += m;
+  }
+  const n = mags.length;
+  if (n < 64) return null;               // too sparse for a 4th moment
+
+  const mean = sum / n;
+  let s2 = 0, s4 = 0;
+  for (let i = 0; i < n; i++) {
+    const d = mags[i] - mean;
+    const d2 = d * d;
+    s2 += d2;
+    s4 += d2 * d2;
+  }
+  const varr = s2 / n;
+  if (varr < 1e-18) return null;
+  return (s4 / n) / (varr * varr);
+}
+
+/**
+ * Locate the junction: the instant of peak impulsiveness after
+ * JUNCTION_ARM. Strictly causal — it only ever reads samples at or before
+ * `endT`, so the live path and the completed-recording path compute the
+ * same thing from the same data.
+ *
+ * The smoothing is a TRAILING mean, deliberately. An earlier version used
+ * a centred one, which reads samples from the future; that inflated the
+ * apparent accuracy and could not be reproduced live.
+ *
+ * NOTE: this differences the raw samples. Binning |a| to a fixed 20 Hz
+ * grid first (to match the offline analysis exactly) was tried and made
+ * the streamed accuracy WORSE — 65% against 85% at arrival-12 s. Do not
+ * "fix" this by adding decimation.
+ *
+ * @param {Array} samples  motion samples
+ * @param {number} endT    look no later than this instant, ms
+ * @returns {number|null}  timestamp of the detected crossing, ms
+ */
+export function detectJunction(samples, endT) {
+  if (!samples || samples.length < 2) return null;
+  const t0 = samples[0].time;
+  const from = t0 + JUNCTION_ARM * 1000;
+  if (endT <= from) return null;
+
+  let prevMag = null, prevT = null;
+  const win = [];              // {t, j} within JERK_SMOOTH
+  let winSum = 0;
+  let bestVal = -Infinity, bestT = null;
+
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    if (s.time > endT) break;
+    const m = Math.hypot(s.ax || 0, s.ay || 0, s.az || 0);
+    if (prevMag !== null) {
+      const dt = (s.time - prevT) / 1000;
+      if (dt > 0) {
+        const j = Math.abs(m - prevMag) / dt;
+        win.push({ t: s.time, j });
+        winSum += j;
+        while (win.length && win[0].t < s.time - JERK_SMOOTH * 1000) {
+          winSum -= win.shift().j;
+        }
+        if (s.time >= from && win.length) {
+          const avg = winSum / win.length;
+          if (avg > bestVal) { bestVal = avg; bestT = s.time; }
+        }
+      }
+    }
+    prevMag = m;
+    prevT = s.time;
+  }
+  return bestT;
+}
+
+/**
  * Derive sign and scale from the user's own labelled examples, so a
  * device whose gravity axes are reported with the opposite sign cannot
  * silently invert every prediction.
@@ -338,6 +494,7 @@ export function magSkew(samples, endT, backHi, backLo) {
 export function calibrate(examples) {
   const L = [], R = [];
   const SL = [], SR = [];       // v2 skew values, per class
+  const KL = [], KR = [];       // v3 junction-anchored kurtosis, per class
   for (const ex of examples || []) {
     const raw = ex.rawMotionData;
     if (!raw || raw.length < 600) continue;
@@ -346,6 +503,14 @@ export function calibrate(examples) {
     const sk = magSkew(raw, end, SKEW_FINAL[0], SKEW_FINAL[1]);
     (ex.label === "left" ? L : R).push(v);
     if (sk !== null) (ex.label === "left" ? SL : SR).push(sk);
+
+    // v3: junction-anchored kurtosis, each example read at its own Stop —
+    // which is what a deployed app has stored from past labelled journeys.
+    const det = detectJunction(raw, end);
+    if (det !== null) {
+      const ku = magKurtosis(raw, det, WIN_JUNCTION[0], WIN_JUNCTION[1]);
+      if (ku !== null) (ex.label === "left" ? KL : KR).push(ku);
+    }
   }
   if (L.length < 3 || R.length < 3) return { ...DEFAULT_CAL, n: L.length + R.length };
 
@@ -383,6 +548,19 @@ export function calibrate(examples) {
     out.scaleSkew = Math.max(ssd, 0.15);
     out.separationSkew = Math.abs(sL - sR) / ssd;
     out.nSkew = SL.length + SR.length;
+  }
+
+  // v3 junction-anchored kurtosis. Median midpoint for the same reason as
+  // the skew threshold: the right-hand class has a long tail (kurtosis
+  // runs to 12 on the sharpest crossings) that would drag a mean.
+  if (KL.length >= 3 && KR.length >= 3) {
+    const kL = median(KL), kR = median(KR);
+    const ksd = Math.sqrt(0.5 * (variance(KL) + variance(KR))) || 1;
+    out.signKurt = kL >= kR ? 1 : -1;
+    out.thrKurt = (kL + kR) / 2;
+    out.scaleKurt = Math.max(ksd, 0.5);
+    out.separationKurt = Math.abs(kL - kR) / ksd;
+    out.nKurt = KL.length + KR.length;
   }
   return out;
 }
@@ -561,6 +739,26 @@ export class ForkEngine {
       phase = "final";
       score = yawIntegral(all, this.arrivalAt, WIN_FINAL[0], WIN_FINAL[1]);
       p = logistic(score, this.cal.thrFinal, this.cal.scaleFinal, this.cal.sign);
+    } else if (this.armed && this.cal.thrKurt !== undefined) {
+      // v3 PRIMARY LIVE PATH: junction-anchored kurtosis. See WIN_JUNCTION.
+      // No braking gate: waiting for braking left 15/26 trips with no
+      // reading at all 12 s before arrival, and for a predictor whose
+      // whole purpose is answering EARLY, silence is a failure. This path
+      // answers on every trip from ~16 s out at 81-85%.
+      const det = detectJunction(all, t);
+      const ku = det === null
+        ? null
+        : magKurtosis(all, det, WIN_JUNCTION[0], WIN_JUNCTION[1]);
+      if (ku === null) {
+        phase = "waiting";
+        score = 0;
+        p = 0.5;
+      } else {
+        phase = "junction";
+        score = ku;
+        p = logistic(ku, this.cal.thrKurt, this.cal.scaleKurt, this.cal.signKurt);
+        p = Math.min(Math.max(p, 0.10), 0.90);   // provisional, cap confidence
+      }
     } else if (this.armed && this.braking && this.cal.thrSkew !== undefined) {
       // v2 live path: |a| skew over a trailing SKEW_TRAIL window.
       //

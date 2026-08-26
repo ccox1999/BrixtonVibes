@@ -79,8 +79,13 @@ export const WIN_EARLY = [22.0, 16.0];
    different platforms 8 and 10 minutes apart (same phone, same pocket)
    and the feature tracked the platform, not the session.
 
-   The window ENDS 8 s before the recording does, so the phone-grab
-   burst at the end cannot contribute.
+   The window ENDS 8 s before the recording does, so the end-of-approach
+   disturbance cannot contribute. That disturbance is measured, not
+   assumed: vibration falls to 0.24 x cruise 7 s before the end and then
+   rises to 0.93 x at 2 s and 1.32 x at 1 s, on 20 of 26 trips. It is the
+   halt itself, the brakes, surrounding passengers, and the Stop tap
+   together — not the user handling the phone, who reports keeping it
+   still. Either way the fix is the same: end the window before it.
 
    HONEST LIMITS. n=26 and the window was chosen by the scan; the
    best-of-scan p-value, a chronological split (85%) and the smooth
@@ -91,10 +96,24 @@ export const WIN_EARLY = [22.0, 16.0];
 export const SKEW_FINAL = [22.0, 8.0];
 
 // Live, arrival is unknown, so the window trails the current instant.
-// Measured accuracy of this trailing window by true time-before-arrival:
-//   24 s: 31%   20 s: 73%   16 s: 85%   12 s: 77%   8 s: 96%   4 s: 96%
-// It is INVERTED at 24 s out, which is why the live path stays silent
-// until braking is detected rather than showing an early reading.
+// Accuracy by true time-before-arrival, STREAMED through this class
+// (an earlier note here quoted 96% at 8 s and 4 s; those came from an
+// offline port that resampled to a uniform grid and did not reproduce):
+//   30 s: 56%   24 s: 67%   20 s: 89%   16 s: 80%
+//   12 s: 91%   8 s: 82%    4 s: 65%    0 s: 77%
+// Two properties matter and both are load-bearing:
+//  - it is INVERTED early (31% at 24 s out on the offline measure), which
+//    is why the live path stays silent until braking is detected;
+//  - it dips in the last ~5 s because the end-of-approach disturbance
+//    enters the window. Vibration falls to 0.24 x cruise at 7 s out then
+//    rises to 0.93 x at 2 s and 1.32 x at 1 s on 20/26 trips — the halt,
+//    the brakes, people standing, and the Stop tap together. That is
+//    precisely why SKEW_FINAL ends 8 s early, and the final verdict is
+//    therefore unaffected by the dip.
+// Attempts to damp the dip (EMA smoothing; freezing on a relative rise;
+// freezing on an absolute rise with a minimum-readings guard) ALL fired
+// too early and cut accuracy at arrival-12 s from 91% to 45-55%, because
+// they lock in the inverted early readings. See the P_SMOOTH note below.
 export const SKEW_TRAIL = 20.0;
 
 // Route prior, Stockwell -> Brixton. See header.
@@ -527,6 +546,12 @@ export class ForkEngine {
         score = sk;
         p = logistic(sk, this.cal.thrSkew, this.cal.scaleSkew, this.cal.signSkew);
         p = Math.min(Math.max(p, 0.10), 0.90);  // provisional, cap confidence
+        // Deliberately NO smoothing, freezing or holding here. All three
+        // were tried to make the display settle and all three fired while
+        // the reading was still inverted, cutting accuracy at arrival-12 s
+        // from 91% to 45-55%. The 20 s window is already an average; the
+        // remaining flicker is the honest cost of not knowing where the
+        // arrival is. See the SKEW_TRAIL note.
       }
     } else if (this.armed && this.cal.thrSkew === undefined) {
       // No skew calibration yet (fewer than 3 labelled trips per side).

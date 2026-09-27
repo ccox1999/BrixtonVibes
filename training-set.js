@@ -1,5 +1,5 @@
 /* ============================================================
-   Victoria Line Motion Lab — training set manager
+   BrixtonVibes — training set manager
 
    Manages the labeled training dataset:
    - localStorage persistence for the SMALL data: feature vectors,
@@ -428,7 +428,7 @@ export class TrainingSet {
   async exportAsFile() {
     const data = await this.toJSONWithRaw();
     const counts = this.countByLabel();
-    data.exportNote = `Victoria Line Motion Lab training data — ${counts.left}L / ${counts.right}R examples`;
+    data.exportNote = `BrixtonVibes training data — ${counts.left}L / ${counts.right}R examples`;
 
     // Compact, no indentation. The raw motion data is ~250k small nested
     // objects, so 2-space indentation made a 35-trip backup 98 MB instead

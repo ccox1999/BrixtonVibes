@@ -1,9 +1,10 @@
-# Victoria Line Motion Lab
+# BrixtonVibes
 
-A mobile-first web app for recording your iPhone's motion sensors on the
-Victoria line — acceleration (m/s²) and rotation rate (°/s) — and learning to
-predict which of Brixton's two platforms a train is heading for. Built for the
-tube, but the recorder works anywhere your phone does.
+A mobile-first web app that predicts which of Brixton's two platforms a
+Victoria line train is heading for, from your iPhone's motion sensors —
+acceleration (m/s²) and rotation rate (°/s) — recorded on the Stockwell →
+Brixton run. Built for the tube, but the recorder works anywhere your phone
+does.
 
 ## Features
 
@@ -14,8 +15,8 @@ tube, but the recorder works anywhere your phone does.
   labelled trip auto-saved (features + approach profile to localStorage,
   full raw motion to IndexedDB — raw recordings are ~3 MB each and would
   blow localStorage's ~5 MB quota)
-- On-device k-NN platform prediction with a live forecast while recording and
-  an honest cross-validated accuracy estimate after each label
+- Live platform forecast while recording, from a physics-based fork engine
+  calibrated on your own labelled trips, and a final reading when you stop
 - Manual JSON backup / restore (save to OneDrive, email, or move to another
   device) as the durable safety net
 - Installable PWA with offline support (works with no signal on the tube)
@@ -54,8 +55,9 @@ logo to rebrand):
 1. **Enable Motion Sensors** — triggers the iOS motion-permission prompt
    (required once per site on iOS 13+).
 2. **Start Recording** — charts begin scrolling; the status row shows a
-   pulsing red dot, live sample count, rate, and duration. With ≥5 labelled
-   trips, a **Live Platform Forecast** card updates every second.
+   pulsing red dot, live sample count, rate, and duration. About 75 s into
+   the journey a **Live Platform Forecast** card starts updating every
+   second (see *Platform prediction* below).
 3. **Stop Recording** — a labelling sheet appears: **← LEFT / RIGHT → / Skip**.
 4. Pick the platform you actually arrived at. The trip's features **and**
    full raw motion are saved to localStorage automatically, an internal
@@ -126,52 +128,78 @@ Internally the app timestamps samples with the monotonic
 converts back to epoch milliseconds on export, so the file format is
 unchanged from earlier versions.
 
-## Platform prediction (ML)
+## Platform prediction
 
-Beyond raw recording, the app can learn to predict which of Brixton's two
-platforms a train is heading for, from the vibration signature of the
-Stockwell → Brixton junction:
+The train must cross the points to reach its platform, and the points sit
+upstream of the platform mouth, so the deciding evidence is recorded before
+the platform is visible. `fork-engine.js` measures two things about the
+approach, both **orientation-invariant** (they cannot learn how you hold
+the phone):
+
+- the **turn** — rotation rate projected onto gravity, integrated over the
+  last 16 s;
+- the **jolt** — how spiky the vibration is (skewness of |acceleration|)
+  over the last 14 s.
+
+Each is compared with your own labelled trips, and the two are averaged.
+When the final braking starts, the reading is held, because later windows
+slide past the junction. Tapping **Stop** replaces the live reading with a
+final one anchored on the arrival.
 
 1. Record a trip, then label it **left** or **right** on the sheet that
-   appears when you stop. The trip's feature vector and raw motion are
-   stored in localStorage.
-2. Once you have 5+ labelled examples of each platform, the classifier is
-   live: cross-validation on your own data picks between a k-NN (z-score
-   normalised, class-separation-weighted features) and an L2 logistic
-   regression, whichever predicts better. The classifier trains **only on
-   orientation-invariant features** — gravity-projected quantities (like
-   the world-frame yaw rate) and motion magnitudes — so it physically
-   cannot learn how you were holding the phone as a proxy for the label.
-   Aggregates come from a 10 s **fork window** anchored to the train's
-   final stop at the Brixton terminus; **approach-shape features** describe
-   the last 30 s before that stop (which way the yaw S-bend of the
-   crossover swings first, and where the switch-clatter roughness sits),
-   because a crossover onto a parallel road has ~zero net heading change —
-   only its time structure distinguishes the two roads.
-3. While recording, a **Live Platform Forecast** card re-predicts every
-   second from the most fork-like window of the trip so far. A borderline
-   call shows **"Not sure"** rather than committing to a coin-flip.
+   appears when you stop.
+2. With 3+ labelled trips of each side the engine calibrates itself from
+   them (at app start and after each label). Until then it shows a rough
+   turn-only reading.
+3. The forecast is honestly near a coin-flip until the train reaches the
+   junction, ~12 s before arrival. Measured on 35 real trips, it is right
+   about **8 times in 10 at 10 s before Stop** (full numbers in
+   `CLAUDE.md`). To re-measure on your own export:
+
+   ```bash
+   node analyze-loocv.mjs victoria-training-YYYY-MM-DD-NLxR.json --trips
+   ```
+
+The older k-NN / logistic-regression classifier (`classifier.js`,
+`features.js`) no longer makes the predictions you see. It still produces
+the "Estimated accuracy" in the alert after each label — which therefore
+describes that old classifier, not the fork engine.
 
 The **🧪 Test Data** button seeds 10 fake examples so the flow can be
-tested without real trips. See `TESTING.md` and `ML-INTEGRATION-GUIDE.md`.
+tested without real trips. They are marked "Fake" in their notes — delete
+them before relying on a backup for analysis.
+
+## Console helpers
+
+The app runs inside an IIFE; its state is exposed for debugging under the
+`motionLab` global:
+
+```javascript
+motionLab.state.trainSet?.getStats();   // counts and stats
+motionLab.state.trainSet.examples[0];   // one stored example
+motionLab.state.forkCal;                // the fork engine's calibration
+```
 
 ## Project structure
 
 ```
 index.html       App shell and markup
 style.css        Mobile-first styles (safe areas, touch targets, states)
-app.js           Sensor capture, chart rendering, export, ML wiring
-features.js      Feature extraction (fork window + approach shape, ES module)
-classifier.js    k-NN / logistic classifiers, orientation-invariant features only
+app.js           Sensor capture, chart rendering, export, prediction wiring
+fork-engine.js   The platform predictor (live reading + final verdict)
+features.js      Feature extraction for the fallback classifier
+classifier.js    k-NN / logistic fallback, orientation-invariant features only
 training-set.js  Labeled training data manager — localStorage + IndexedDB
 raw-store.js     IndexedDB store for full raw recordings (quota-proof)
 manifest.json    PWA install metadata
 sw.js            Service worker — offline app-shell cache (optional)
+analyze-loocv.mjs  Offline accuracy check of fork-engine.js (Node)
+CLAUDE.md        Project history, findings and decisions
 README.md        This file
 ```
 
 **When you edit any file, bump `CACHE_VERSION` in `sw.js`** (e.g.
-`motion-lab-v1` → `motion-lab-v2`) so returning visitors get the new
+`brixtonvibes-v34` → `brixtonvibes-v35`) so returning visitors get the new
 version instead of the cached one. If you'd rather not deal with
 caching at all, simply delete `sw.js` — the app detects its absence
 and runs normally, just without offline support.

@@ -1,5 +1,5 @@
 /* ============================================================
-   Victoria Line Motion Lab — k-NN classifier
+   BrixtonVibes — k-NN classifier
 
    Predicts platform direction (left vs. right) based on
    vibration signatures using k-nearest neighbors.

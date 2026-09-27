@@ -1,5 +1,5 @@
 /* ============================================================
-   Victoria Line Motion Lab — service worker (optional file)
+   BrixtonVibes — service worker (optional file)
    ------------------------------------------------------------
    Simple offline app shell. Useful on the tube, where this app
    is most likely to be used and connectivity is worst.
@@ -11,7 +11,7 @@
 
 "use strict";
 
-const CACHE_VERSION = "motion-lab-v33";
+const CACHE_VERSION = "brixtonvibes-v34";
 
 // Everything the app needs to boot with no network at all.
 const APP_SHELL = [

@@ -1,4 +1,12 @@
-# Victoria Line Motion Lab — Project Context
+# BrixtonVibes — Project Context
+
+## Renamed and tidied (2026-09-27, sw v34)
+
+Formerly "Victoria Line Motion Lab" / repo `Viccy-Line-Accel-App-Fable-Refactor`. Now **BrixtonVibes**: GitHub repo `ccox1999/BrixtonVibes`, Pages at `https://ccox1999.github.io/BrixtonVibes/`, local folder `Victoria Line Predictor\BrixtonVibes`. Only DISPLAY names changed. **Never rename the storage names** — localStorage key `victoria-line-training-set`, IndexedDB `motion-lab-raw` — or every phone loses its saved trips. Backup files keep the `victoria-training-*.json` name, which `.gitignore` relies on to keep personal data off the public repo.
+
+Removed as obsolete: `fork-engine-v2-report.html` (v2 engine, replaced twice), `ML-INTEGRATION-GUIDE.md` (June plan, long done), `TESTING.md` (duplicated README; console helpers moved there), `__restore-test.html` (needed a deleted file), `__v4-test.html` section F (same), and the `Victoria line vibrations check` folder beside this one (every real trip in its four exports verified identical in the 35-trip file; its July Python prototype was superseded by fork-engine.js). Local test pages run with `node __serve-tests.mjs <page>` (all `__*` files gitignored): `__v4-test.html` 34/34, `__export-test.html` 9/9.
+
+**Known issue, not fixed:** the "Estimated accuracy" alert after labelling (`estimateAccuracy` in app.js) reports the OLD kNN/logreg classifier's CV accuracy, not the fork engine's, so it describes a model that no longer makes the visible predictions.
 
 ## Current state (2026-09-27) — first prospective test; live path rebuilt (FORK_ENGINE_VERSION 3, sw v32)
 

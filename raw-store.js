@@ -1,5 +1,5 @@
 /* ============================================================
-   Victoria Line Motion Lab — raw motion data store (IndexedDB)
+   BrixtonVibes — raw motion data store (IndexedDB)
 
    WHY THIS EXISTS: raw motion data is ~3 MB of JSON per trip, and
    localStorage tops out around 5 MB on iOS Safari. The old design

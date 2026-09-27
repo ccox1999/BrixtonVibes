@@ -1,8 +1,8 @@
 {
   "id": "./",
-  "name": "Victoria Line Motion Lab",
-  "short_name": "Motion Lab",
-  "description": "Record and visualise iPhone motion-sensor data (acceleration and rotation) in real time, and export sessions as JSON.",
+  "name": "BrixtonVibes",
+  "short_name": "BrixtonVibes",
+  "description": "Predicts which Brixton platform a Victoria line train is heading for, from your iPhone's motion sensors.",
   "lang": "en-GB",
   "start_url": "./",
   "scope": "./",

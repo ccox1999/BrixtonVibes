@@ -17,9 +17,9 @@
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'">
 
-  <title>Victoria Line Motion Lab</title>
+  <title>BrixtonVibes</title>
   <meta name="description"
-        content="Record iPhone motion-sensor data (acceleration and rotation), watch it live on scrolling charts, and export sessions as JSON.">
+        content="Predicts which Brixton platform a Victoria line train is heading for, from your iPhone's motion sensors.">
 
   <!-- PWA / iOS app-shell configuration -->
   <link rel="manifest" href="manifest.json">
@@ -29,12 +29,11 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <!-- black-translucent: page draws under the status bar; CSS safe-area padding compensates -->
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Motion Lab">
+  <meta name="apple-mobile-web-app-title" content="BrixtonVibes">
   <!-- Stop iOS auto-linking numbers like "60 Hz" as phone numbers -->
   <meta name="format-detection" content="telephone=no">
 
-  <!-- Add a 180x180 PNG named apple-touch-icon.png to the repo for a Home Screen icon.
-       Until then iOS falls back to a screenshot (a missing file here is harmless). -->
+  <!-- 180x180 Home Screen icon for iOS -->
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
   <!-- Also serves as the favicon (stops the /favicon.ico 404 in console) -->
   <link rel="icon" type="image/png" href="icon-192.png">
@@ -55,8 +54,8 @@
     <div class="app-main">
 
     <header class="app-header">
-      <h1>Victoria Line</h1>
-      <p class="subtitle">Stockwell → Brixton</p>
+      <h1>BrixtonVibes</h1>
+      <p class="subtitle">Victoria line · Stockwell → Brixton</p>
     </header>
 
     <section id="liveForcastCard" class="card forecast-card hidden" aria-label="Live platform forecast">

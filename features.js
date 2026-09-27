@@ -1,5 +1,5 @@
 /* ============================================================
-   Victoria Line Motion Lab — feature extraction
+   BrixtonVibes — feature extraction
 
    Extracts ML-ready features from raw motion data.
 

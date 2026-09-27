@@ -1,5 +1,5 @@
 /* ============================================================
-   Victoria Line Motion Lab — app logic
+   BrixtonVibes — app logic
    ------------------------------------------------------------
    Key fixes vs. the original:
    - Rendering is driven by a self-rescheduling requestAnimationFrame
@@ -1597,7 +1597,7 @@ async function loadMLModules() {
 
   // Debug handle: the app runs inside an IIFE, so `state` isn't otherwise
   // reachable from the console. Exposed read-side only for the helpers
-  // documented in TESTING.md (e.g. `motionLab.state.trainSet.getStats()`).
+  // documented in README.md (e.g. `motionLab.state.trainSet.getStats()`).
   if (typeof window !== "undefined") {
     window.motionLab = { state };
   }

@@ -611,12 +611,15 @@ async function loadMLModules() {
           pLeft: forkOut.pLeft, pRight: forkOut.pRight, source: "fork-engine",
         };
         updateForecastPodium(forkOut.pLeft * 100, forkOut.pRight * 100);
+        // "provisional" is honestly near chance until ~12 s before arrival
+        // (the junction is not yet crossed); "held" is the reading frozen as
+        // the final braking began. See the v4 note in fork-engine.js.
         ui.forecastNote.textContent =
-          forkOut.phase === "final"
-            ? "arrival detected — fork reading"
-            : forkOut.phase === "junction"
-              ? "junction crossed — live call"
-              : "braking — provisional reading";
+          forkOut.phase === "held"
+            ? "braking — reading held"
+            : forkOut.phase === "provisional"
+              ? "approach — provisional, firms up ~10 s out"
+              : "provisional reading";
         return;
       }
       // Before the route prior arms (first ~75 s) there is no fork evidence

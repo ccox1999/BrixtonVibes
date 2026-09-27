@@ -1,6 +1,23 @@
 # Victoria Line Motion Lab — Project Context
 
-## Current state (2026-07-31) — fork-engine.js is now the live prediction path
+## Current state (2026-09-27) — first prospective test; live path rebuilt (FORK_ENGINE_VERSION 3, sw v32)
+
+`victoria-training-2026-09-27-19L16R.json` (in this folder, gitignored) adds 9 trips (examples 27-35, 5L/4R) recorded AFTER the skew/kurtosis constants were chosen on examples 1-26 — the first genuinely prospective test. Measured with the new `analyze-loocv.mjs`, which streams every trip through the shipped `ForkEngine` class once per second (the app's cadence), counts silence as wrong, and refits calibration per fold.
+
+**What held and what didn't** (calibrated on the old 26 only, scored on the new 9):
+- v3 live path, junction-anchored kurtosis: **4/9, AUC 0.55 — chance.** Retired.
+- Post-Stop skew verdict `[arr-22, arr-8]`: **6/9** (was 25/26). 3 of 4 new right trips have skew 0.22-0.32, in the left range. The recordings did not change (60 Hz, |g|, carry pose, every trip ends 2-3 s after the halt) — the jolt that marked right arrivals weakened. Left unchanged (31/35 LOOCV overall) because the alternatives (yaw 8/9 prospective but 28/35 overall) can't be separated on 9 trips.
+- Yaw integral `[arr-26, arr-10]` (the July physics hypothesis, fixed on trips 1-15): AUC 0.80 old, **0.85 new** — the one signal that held up.
+
+**New live path (v4, fork-engine.js).** A trailing window needs no arrival estimate: read 10 s before Stop, yaw over `[t-16, t]` and skew over `[t-14, t]` ARE the arrival-anchored windows. Both are z-scored against the user's own trips at exactly that lead and averaged. Once vibration drops below 0.55 x cruise for 3 s (the final braking) the reading from when the decline began is held; it re-arms if vibration returns to cruise for 5 s (a pre-platform hold). LOOCV all 35: **83% at 10 s before Stop** (v3: 74%); prospective **8/9** (v3: 4/9); best-of-family permutation p = 0.0015.
+
+**Not met / known limits.** Flips between 30 and 10 s out: 1.26/trip (target was <= 1) — before ~12 s out the junction hasn't been crossed and the reading is near chance. After long pre-platform holds the hold sometimes fails to re-engage (cruise median includes stationary time), so the last seconds can decay. Shown confidence is under-confident (69% shown vs 83% correct).
+
+**The 2026-09-27 overhaul prompt was tested and mostly rejected.** Its premise — that the post-Stop verdict is ~96% right and the live path is merely held back — is false on new data (6/9). Measured at 10 s out: skew-first/no braking gate 74%, adaptive `[t-30,t]`→`[t-22,t-8]` 63%, plus hysteresis 57%. Passing `recordingComplete=true` in `makeLivePrediction` has no effect (that call only feeds the kNN fallback, which never runs while the engine answers), and confidence caps change the number shown, never the side. Run `node analyze-loocv.mjs <export.json> [--train-before YYYY-MM-DD] [--trips]` to re-measure after any change; treat the next several trips as the next prospective test.
+
+---
+
+## Previous state (2026-07-31) — fork-engine.js is now the live prediction path
 
 Analysis of `victoria-training-2026-07-31-9L6R.json` (15 trips, 9L/6R, full raw) found a **physics-derived rule that beats the learned pipeline**, and it is now wired in as the primary live engine ([fork-engine.js](fork-engine.js), FORK_ENGINE_VERSION 1). FEATURE_VERSION is **untouched** — no re-extraction, the kNN/logreg path is intact and still runs as the fallback when the engine has no verdict.
 

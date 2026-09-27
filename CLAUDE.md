@@ -15,6 +15,8 @@
 
 **The 2026-09-27 overhaul prompt was tested and mostly rejected.** Its premise — that the post-Stop verdict is ~96% right and the live path is merely held back — is false on new data (6/9). Measured at 10 s out: skew-first/no braking gate 74%, adaptive `[t-30,t]`→`[t-22,t-8]` 63%, plus hysteresis 57%. Passing `recordingComplete=true` in `makeLivePrediction` has no effect (that call only feeds the kNN fallback, which never runs while the engine answers), and confidence caps change the number shown, never the side. Run `node analyze-loocv.mjs <export.json> [--train-before YYYY-MM-DD] [--trips]` to re-measure after any change; treat the next several trips as the next prospective test.
 
+**Backups are now compact (sw v33).** `exportAsFile` writes `JSON.stringify(data)` with no indentation: the raw data is ~250k small nested objects, so indentation made a 35-trip backup 98 MB instead of 65 MB. Restore parses both forms. The 19L16R file had been rewritten by an earlier session with PowerShell `ConvertTo-Json` (220 MB, BOM, column-aligned indentation) while stripping 10 Test-Data fakes from the app's 24L21R export; it was re-saved compactly and verified identical. **Never round-trip these exports through PowerShell's ConvertFrom/ConvertTo-Json** — use Node. Verified in headless Edge by `__export-test.html` (9/9: restore compact + old indented files, backup, round trip, dedup, fork calibration). Headless Edge gotchas: pass `--disable-extensions --disable-sync` (force-installed extensions otherwise start their own sign-in flows), and on Windows `path.resolve` the server root before a `startsWith` containment check or every request 403s.
+
 ---
 
 ## Previous state (2026-07-31) — fork-engine.js is now the live prediction path

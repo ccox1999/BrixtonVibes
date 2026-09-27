@@ -430,7 +430,11 @@ export class TrainingSet {
     const counts = this.countByLabel();
     data.exportNote = `Victoria Line Motion Lab training data — ${counts.left}L / ${counts.right}R examples`;
 
-    const jsonStr = JSON.stringify(data, null, 2);
+    // Compact, no indentation. The raw motion data is ~250k small nested
+    // objects, so 2-space indentation made a 35-trip backup 98 MB instead
+    // of 65 MB — and the whole string is built in memory on the phone.
+    // Restore parses either form, so older indented backups still load.
+    const jsonStr = JSON.stringify(data);
     const blob = new Blob([jsonStr], { type: "application/json" });
     const dateStr = new Date().toISOString().slice(0, 10);
     const filename = `victoria-training-${dateStr}-${counts.left}L${counts.right}R.json`;

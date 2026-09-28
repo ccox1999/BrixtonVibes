@@ -11,7 +11,7 @@
 
 "use strict";
 
-const CACHE_VERSION = "brixtonvibes-v37";
+const CACHE_VERSION = "brixtonvibes-v38";
 
 // Everything the app needs to boot with no network at all.
 const APP_SHELL = [

@@ -109,7 +109,9 @@ carry a `rawMotionData` array — one object per motion sample, in this shape:
     "rotationGamma": 0.02,
     "gx": 0.12,
     "gy": -9.78,
-    "gz": 0.63
+    "gz": 0.63,
+    "heading": 187.42,
+    "headingAccuracy": 15
   }
 ]
 ```
@@ -123,6 +125,12 @@ carry a `rawMotionData` array — one object per motion sample, in this shape:
   ML features to find world-vertical regardless of phone orientation.
   Older recordings without these fields still load; the
   orientation-invariant features just read as zero for them.
+- `heading` — compass heading in degrees clockwise from magnetic north
+  (the latest reading when the motion sample arrived, to 0.01°), and
+  `headingAccuracy` — its accuracy in ± degrees (iPhone only). Either is
+  `null` when the device gives no reading. Recorded from v38 for future
+  analysis; **nothing predicts from it yet**, and trips recorded before
+  v38 simply don't have these fields.
 
 Internally the app timestamps samples with the monotonic
 `performance.now()` clock (immune to clock changes mid-recording) and

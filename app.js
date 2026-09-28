@@ -137,7 +137,7 @@ async function loadMLModules() {
 
   const state = {
     recording: false,
-    data: [],            // { time, ax, ay, az, rotationAlpha, rotationBeta, rotationGamma }
+    data: [],            // { time, ax, ay, az, rotationAlpha, rotationBeta, rotationGamma, gx, gy, gz, heading, headingAccuracy }
     startTime: null,     // performance.now() ms at recording start
     dataTrimmed: false,  // true once the rolling buffer has dropped old samples
     rafId: null,         // current requestAnimationFrame handle
@@ -153,6 +153,12 @@ async function loadMLModules() {
     // is the pure clock difference, since handler delay is always ≥ 0). See
     // motionTime().
     motionTsOffset: null,
+    // Latest compass reading (degrees clockwise from magnetic north) and its
+    // accuracy (± degrees; iOS only), from deviceorientation. Recorded on
+    // each motion sample for future analysis only — nothing predicts from
+    // it yet. null until the first reading (or if the device has none).
+    heading: null,
+    headingAccuracy: null,
 
     // ML state (Phase 1 & 2)
     trainSet: null,           // TrainingSet instance (loaded on init)
@@ -810,6 +816,9 @@ async function loadMLModules() {
         gx: s.gx ?? 0,
         gy: s.gy ?? 0,
         gz: s.gz ?? 0,
+        // Compass: null, never 0 — 0 would mean "due north".
+        heading: s.heading ?? null,
+        headingAccuracy: s.headingAccuracy ?? null,
       }));
 
       state.trainSet.add(features, label, {
@@ -1248,6 +1257,10 @@ async function loadMLModules() {
       gx: (aig?.x ?? 0) - (acc?.x ?? 0),
       gy: (aig?.y ?? 0) - (acc?.y ?? 0),
       gz: (aig?.z ?? 0) - (acc?.z ?? 0),
+      // Latest compass reading (see handleOrientation), rounded: compass
+      // accuracy is whole degrees at best, so more digits only bloat backups.
+      heading: state.heading === null ? null : Math.round(state.heading * 100) / 100,
+      headingAccuracy: state.headingAccuracy === null ? null : Math.round(state.headingAccuracy * 10) / 10,
     });
 
     // First sample arrived — cancel the "no data" watchdog.
@@ -1266,6 +1279,33 @@ async function loadMLModules() {
     scheduleRender(); // idempotent — keeps the loop alive if it ever stopped
   }
 
+  /**
+   * Compass. Recorded for future analysis ONLY — the predictor does not use
+   * it. The hope is a heading reference could show the turn at the points
+   * directly; whether it survives the tunnel's magnetic noise (traction
+   * current, steel) is exactly what the recordings are meant to find out.
+   *
+   * iOS gives webkitCompassHeading (degrees clockwise from magnetic north)
+   * and webkitCompassAccuracy (± degrees; negative = unreliable). Other
+   * browsers give an absolute alpha (counter-clockwise from north) on
+   * deviceorientationabsolute. Anything without a true north is ignored.
+   */
+  function handleOrientation(event) {
+    if (!state.recording) return;
+    let heading = null;
+    if (typeof event.webkitCompassHeading === "number" && Number.isFinite(event.webkitCompassHeading)) {
+      heading = event.webkitCompassHeading;
+    } else if (event.absolute && typeof event.alpha === "number" && Number.isFinite(event.alpha)) {
+      heading = (360 - event.alpha) % 360;
+    }
+    if (heading === null) return;
+    state.heading = heading;
+    state.headingAccuracy =
+      typeof event.webkitCompassAccuracy === "number" && Number.isFinite(event.webkitCompassAccuracy)
+        ? event.webkitCompassAccuracy
+        : null;
+  }
+
   // ---------- Permission flow ----------------------------------------------
 
   ui.sensorBtn.addEventListener("click", async () => {
@@ -1278,7 +1318,18 @@ async function loadMLModules() {
 
       // iOS 13+ requires an explicit permission request from a user gesture.
       if (typeof DeviceMotionEvent.requestPermission === "function") {
-        const response = await DeviceMotionEvent.requestPermission();
+        // Ask for orientation (the compass) in the same tap. Both requests
+        // must START synchronously inside the gesture, so neither waits for
+        // the other. Motion decides whether recording can go ahead; the
+        // compass is optional — without it, recorded headings are just null.
+        const motionAsk = DeviceMotionEvent.requestPermission();
+        const orientationAsk =
+          typeof DeviceOrientationEvent !== "undefined" &&
+          typeof DeviceOrientationEvent.requestPermission === "function"
+            ? DeviceOrientationEvent.requestPermission().catch(() => "denied")
+            : Promise.resolve("n/a");
+        const response = await motionAsk;
+        await orientationAsk;
         if (response !== "granted") {
           setPill("denied", "Permission denied");
           // iOS remembers the denial — explain how to get re-prompted.
@@ -1336,6 +1387,12 @@ async function loadMLModules() {
     // Attach only while recording: a permanently-attached devicemotion
     // listener keeps iOS sensors powered and drains the battery even idle.
     window.addEventListener("devicemotion", handleMotion, { passive: true });
+    // Compass (recorded only). iOS reports it on deviceorientation, other
+    // browsers on deviceorientationabsolute; listening to both is harmless.
+    state.heading = null;
+    state.headingAccuracy = null;
+    window.addEventListener("deviceorientation", handleOrientation, { passive: true });
+    window.addEventListener("deviceorientationabsolute", handleOrientation, { passive: true });
 
     // If nothing arrives, tell the user instead of recording silence.
     state.watchdogId = setTimeout(() => {
@@ -1377,6 +1434,8 @@ async function loadMLModules() {
   async function stopRecording() {
     state.recording = false;
     window.removeEventListener("devicemotion", handleMotion);
+    window.removeEventListener("deviceorientation", handleOrientation);
+    window.removeEventListener("deviceorientationabsolute", handleOrientation);
     disableRecordingScroll();                      // restore native scrolling
     document.body.classList.remove("recording");   // restore native touch-action
 

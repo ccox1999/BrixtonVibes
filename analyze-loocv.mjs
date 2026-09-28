@@ -9,7 +9,9 @@
    Only the live call counts: tapping Stop freezes whatever was on screen,
    and there is no post-Stop verdict. Nothing on screen counts as WRONG.
    "firm" = the frozen call (phase "firm"); before the freeze the screen
-   shows a provisional rolling reading.
+   shows a provisional rolling reading, and a freeze too early in the
+   journey to be the platform (phase "held", probably a signal wait) is
+   shown but not firm.
 
    Usage (Node 18+):
      node analyze-loocv.mjs <export.json>

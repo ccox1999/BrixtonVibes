@@ -153,15 +153,17 @@ freezes whatever was on screen the instant before.
   the train has crossed the junction, ~12 s before arrival.
 - When the final braking begins, the call is **frozen** and shown firm
   ("braking — this is the call"), usually 6–9 s before the train stops.
-- If the train stops at a signal outside Brixton and then moves off
-  again, that was a wait, not the arrival: the call made there is
-  withdrawn ("moving again") and re-made on the final approach. A wait
-  looks exactly like arriving until the train moves again, so on those
-  trips the call can change after it first firms up.
+- If the train brakes to a halt before it has been moving long enough to
+  be at the platform, it is almost certainly a signal wait outside
+  Brixton: the call is held but not shown as firm ("could be a signal
+  stop"). When the train moves off again the call is withdrawn ("moving
+  again") and re-made on the final approach. This catches 17 of 20 waits
+  in the recorded trips, so the call rarely changes after it firms up.
 
 Measured on 35 real trips (each tested with settings fitted on the
 others), the call frozen at Stop is right **89%** of the time, and at every
-moment from 10 s before Stop onwards (full numbers in `CLAUDE.md`).
+moment from 10 s before Stop onwards; once firm it changes on 2 trips in
+35 (full numbers in `CLAUDE.md`).
 
 1. Record a trip, then label it **left** or **right** on the sheet that
    appears when you stop.

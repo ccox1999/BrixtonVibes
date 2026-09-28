@@ -116,6 +116,62 @@ export const RELEASE_FRAC = 0.5;      // release once vibration >= this x cruise
 export const RELEASE_HOLD = 4.0;      // ... for this many seconds (moved off again)
 export const REREAD_DELAY = 8.0;      // s the screen stays clear after moving off
 export const REPORT_LEAD = 12.0;      // s before Stop the save pop-up reports
+// A freeze made before the train has been MOVING for this long is probably
+// a signal wait outside Brixton, not the final approach: it is still
+// frozen, but not presented as a firm call. "Moving" = a second whose
+// vibration is at least WAIT_MOVING_FRAC x the cruise quantile so far.
+// See the v5.1 note.
+export const WAIT_MOVING_FRAC = 0.6;
+export const WAIT_MOVING_SEC = 63;
+
+/* ------------------------------------------------------------
+   v5.1 — A FREEZE EARLY IN THE JOURNEY IS NOT PRESENTED AS FIRM
+   ------------------------------------------------------------
+   v5's changes of mind (0.57 per trip) all came from waits at a signal
+   outside Brixton: the train brakes to a halt exactly as it does at the
+   platform, so the call freezes there too, on a pre-junction reading that
+   is a coin toss (10/19) — then changes when the train moves off. By
+   vibration alone the two are indistinguishable at the freeze.
+
+   Where the train is along the line is not. The signal is further back
+   than the platform, so fewer seconds of MOVING have elapsed at a wait
+   than at the final freeze. Counting only moving seconds (vibration >=
+   0.6 x the 75th-percentile cruise) makes this immune to how long before
+   departure the recording started and to mid-route holds. Over 35 trips:
+       final freezes  63-93 moving s (median 75)
+       wait freezes   51-72 moving s (median 56)
+   WAIT_MOVING_SEC is the lowest value at any final freeze, so no final
+   freeze in the data is ever downgraded; it catches 17/20 waits. Chosen
+   with NO left/right labels (only which freezes were later released).
+   Prospectively, the same rule fitted on the 26 older trips gives the
+   same cut (63) and on the 9 newer trips catches 8/9 waits while
+   downgrading 0/8 final freezes.
+
+   A downgraded freeze keeps its value ON SCREEN (phase "held", styled
+   provisional: "could be a signal stop"), so accuracy is untouched; only
+   the firm styling is withheld. The cost of a wrong downgrade is a final
+   call shown provisional; the cost of a missed wait is a possible change
+   of mind — hence a cut at the edge of the finals, not in the middle.
+
+   RESULT (analyze-loocv.mjs): accuracy identical to v5 at every lead;
+   changes of mind after the first firm call 0.57 -> 0.06 per trip LOOCV
+   (the 2 left are trips 26 and 27, whose waits sit above the cut) and
+   1.33 -> 0.11 prospectively. A firm call on screen BEFORE the junction
+   (more than 16 s out): 16/35 trips -> 2/35; a wrong one 11/35 -> 1/35.
+
+   WHAT CANNOT BE MET WITH THESE SIGNALS (measured, not assumed):
+   - 80% at 16 s before Stop: even the best of 11 readings tried in this
+     project, each calibrated at that lead and picked afterwards, reaches
+     only 27/35 (77%). The points have not been fully crossed.
+   - 80% at 12 s: offline, one pairing (yaw 16 + skew 10) reaches 30/35,
+     but streamed through this engine it scores 71%; all nine window
+     pairings streamed top out at the shipped 74%. A faster display
+     refresh (0.5 s, 0.25 s) moves 12 s by at most one trip, either way.
+   - A FIRM call at the junction (12-16 s out): the freeze needs the
+     final braking, which begins ~10-12 s out, and a call frozen earlier
+     reads a worse window (above). The firm call appears at a median 8 s
+     before Stop.
+   ------------------------------------------------------------ */
 
 /* ------------------------------------------------------------
    v4 LIVE PATH — rolling turn + jolt reading, held once braking starts.
@@ -750,6 +806,9 @@ export class ForkEngine {
     this.readAt = null;     // ms, instant whose reading the freeze holds
     this.frozenZ = null;    // that reading, computed at the next verdict
     this.releasedAt = null; // ms, when the last freeze was released
+    // v5.1 — see that note.
+    this.movingSec = 0;     // seconds so far with vibration >= WAIT_MOVING_FRAC x cruise
+    this.maybeWait = false; // the current freeze came too early to be the platform
   }
 
   /**
@@ -759,6 +818,8 @@ export class ForkEngine {
    *   phase: "waiting"     nothing new to show (the display keeps the last)
    *          "provisional" the rolling reading; not a firm call
    *          "firm"        the call frozen as braking began
+   *          "held"        frozen too, but too early in the journey to be
+   *                        the platform — probably a signal wait; not firm
    *          "cleared"     the train moved off after a wait; clear the
    *                        screen until the reading has refilled
    *          "early"       v1 yaw fallback before there is a calibration
@@ -786,9 +847,9 @@ export class ForkEngine {
       this.rmsSamples.push(rms);
       this.rmsNext = elapsed + 1;
       // Sorted once a second here rather than on every sample.
-      if (this.rmsSamples.length >= 10 && elapsed >= WARMUP) {
-        this.cruise = quantile(this.rmsSamples, FREEZE_CRUISE_Q);
-      }
+      const q = quantile(this.rmsSamples, FREEZE_CRUISE_Q);
+      if (rms >= WAIT_MOVING_FRAC * q) this.movingSec++;
+      if (this.rmsSamples.length >= 10 && elapsed >= WARMUP) this.cruise = q;
     }
 
     if (!this.armed && elapsed >= AUTO_ARM_AT) this.armed = true;
@@ -812,6 +873,7 @@ export class ForkEngine {
           this.readAt = this.lowSince;
           this.frozenZ = null;      // read at the next verdict (needs `all`)
           this.highSince = null;
+          this.maybeWait = this.movingSec < WAIT_MOVING_SEC;
         }
       } else {
         if (rms >= RELEASE_FRAC * this.cruise) {
@@ -842,7 +904,7 @@ export class ForkEngine {
         // Read once, at the first verdict after the freeze. The reading
         // only uses samples up to readAt, which is in the past.
         if (this.frozenZ === null) this.frozenZ = liveReadingAt(all, this.readAt, c);
-        if (this.frozenZ !== null) { phase = "firm"; score = this.frozenZ; }
+        if (this.frozenZ !== null) { phase = this.maybeWait ? "held" : "firm"; score = this.frozenZ; }
       }
       if (phase === "waiting") {
         if (this.releasedAt !== null && t - this.releasedAt < REREAD_DELAY * 1000) {
@@ -856,7 +918,7 @@ export class ForkEngine {
       }
       // The average of two z-scores, used directly as log-odds. No cap:
       // measured, it is if anything under-confident (see the v4 note).
-      if (phase === "firm" || phase === "provisional") p = logistic(score, 0, 1, 1);
+      if (phase === "firm" || phase === "held" || phase === "provisional") p = logistic(score, 0, 1, 1);
     } else if (this.armed) {
       // No live calibration yet (fewer than 3 labelled trips per side).
       // Fall back to the v1 yaw reading so a fresh install still shows
@@ -875,6 +937,7 @@ export class ForkEngine {
       elapsed,
       armed: this.armed,
       frozen: this.frozen,
+      movingSec: this.movingSec,
     };
   }
 

@@ -622,6 +622,9 @@ async function loadMLModules() {
         // "firm" is the call frozen as the final braking began; everything
         // before it is the rolling reading, honestly near chance until the
         // junction has been crossed, and styled as provisional.
+        // "held" is frozen too, but came too early in the journey to be the
+        // platform — most likely a signal wait — so it is not presented as
+        // the call (fork-engine.js v5.1).
         const firm = forkOut.phase === "firm";
         state.lastLivePrediction = {
           pLeft: forkOut.pLeft, pRight: forkOut.pRight, source: "fork-engine", firm,
@@ -630,7 +633,9 @@ async function loadMLModules() {
         setForecastStyle(firm ? "firm" : "provisional");
         ui.forecastNote.textContent = firm
           ? "braking — this is the call"
-          : "provisional — firms up as the train brakes";
+          : forkOut.phase === "held"
+            ? "slowing — could be a signal stop, not the platform"
+            : "provisional — firms up as the train brakes";
         return;
       }
       // Before the route prior arms (first ~75 s) there is no fork evidence

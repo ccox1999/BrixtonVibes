@@ -584,24 +584,38 @@ export function detectJunction(samples, endT) {
  * @returns {object} calibration, or DEFAULT_CAL if there is not enough data
  */
 export function calibrate(examples) {
+  return fitCalibration((examples || []).map(measureTrip).filter(Boolean));
+}
+
+/**
+ * Every window value calibrate() needs from one labelled trip, measured
+ * once so that estimateAccuracy() can refit per fold without re-reading
+ * the raw data. Null if the recording is too short to use.
+ */
+function measureTrip(ex) {
+  const raw = ex.rawMotionData;
+  if (!raw || raw.length < 600) return null;
+  const end = raw[raw.length - 1].time;           // user stops at arrival
+  const cut = end - LIVE_CAL_LEAD * 1000;
+  return {
+    left: ex.label === "left",
+    yawFinal: yawIntegral(raw, end, WIN_FINAL[0], WIN_FINAL[1]),
+    skewFinal: magSkew(raw, end, SKEW_FINAL[0], SKEW_FINAL[1]),   // may be null
+    yawLive: yawIntegral(raw, cut, LIVE_YAW_TRAIL, 0),
+    skewLive: magSkew(raw, cut, LIVE_SKEW_TRAIL, 0),              // may be null
+  };
+}
+
+function fitCalibration(trips) {
   const L = [], R = [];
   const SL = [], SR = [];       // v2 skew values, per class
   const YL = [], YR = [];       // v4 live yaw, per class
   const LSL = [], LSR = [];     // v4 live skew, per class
-  for (const ex of examples || []) {
-    const raw = ex.rawMotionData;
-    if (!raw || raw.length < 600) continue;
-    const end = raw[raw.length - 1].time;         // user stops at arrival
-    const left = ex.label === "left";
-    const v = yawIntegral(raw, end, WIN_FINAL[0], WIN_FINAL[1]);
-    const sk = magSkew(raw, end, SKEW_FINAL[0], SKEW_FINAL[1]);
-    (left ? L : R).push(v);
-    if (sk !== null) (left ? SL : SR).push(sk);
-
-    const cut = end - LIVE_CAL_LEAD * 1000;
-    (left ? YL : YR).push(yawIntegral(raw, cut, LIVE_YAW_TRAIL, 0));
-    const ls = magSkew(raw, cut, LIVE_SKEW_TRAIL, 0);
-    if (ls !== null) (left ? LSL : LSR).push(ls);
+  for (const t of trips) {
+    (t.left ? L : R).push(t.yawFinal);
+    if (t.skewFinal !== null) (t.left ? SL : SR).push(t.skewFinal);
+    (t.left ? YL : YR).push(t.yawLive);
+    if (t.skewLive !== null) (t.left ? LSL : LSR).push(t.skewLive);
   }
   if (L.length < 3 || R.length < 3) return { ...DEFAULT_CAL, n: L.length + R.length };
 
@@ -871,10 +885,71 @@ export class ForkEngine {
    * @returns {number|null} null if the skew window is too sparse
    */
   liveReading(all, t) {
-    const { liveYaw: y, liveSkew: k } = this.cal;
-    const sk = magSkew(all, t, LIVE_SKEW_TRAIL, 0);
-    if (sk === null) return null;
-    const yw = yawIntegral(all, t, LIVE_YAW_TRAIL, 0);
-    return 0.5 * (y.sign * (yw - y.thr) / y.sd + k.sign * (sk - k.thr) / k.sd);
+    return liveReadingAt(all, t, this.cal);
   }
+}
+
+/**
+ * The v4 live reading at instant t (ms): the equal-weight mean of the
+ * trailing yaw and skew z-scores, oriented so that positive = LEFT. Reads
+ * only samples at or before t, so on a finished recording it gives exactly
+ * what the live display computed at that instant.
+ *
+ * @param {Array} samples  motion samples
+ * @param {number} t       instant, ms
+ * @param {object} cal     calibration with liveYaw and liveSkew
+ * @returns {number|null}  null if the skew window is too sparse
+ */
+export function liveReadingAt(samples, t, cal) {
+  const { liveYaw: y, liveSkew: k } = cal;
+  const sk = magSkew(samples, t, LIVE_SKEW_TRAIL, 0);
+  if (sk === null) return null;
+  const yw = yawIntegral(samples, t, LIVE_YAW_TRAIL, 0);
+  return 0.5 * (y.sign * (yw - y.thr) / y.sd + k.sign * (sk - k.thr) / k.sd);
+}
+
+/**
+ * How often this engine is right on the user's own trips, each trip
+ * tested with a calibration fitted on all the OTHERS (leave-one-out), so
+ * no trip grades itself. Shown to the user after each label.
+ *
+ *   liveCorrect   the rolling live reading LIVE_CAL_LEAD (10) s before
+ *                 Stop. It ignores the braking hold, which can replace
+ *                 that reading on screen; on the 35-trip set both came to
+ *                 29/35. analyze-loocv.mjs measures the fully streamed
+ *                 display.
+ *   finalCorrect  the post-Stop verdict (finalVerdict).
+ *
+ * Each trip is measured once and only the fitting is repeated per fold,
+ * so this is cheap enough to run on the phone after every label.
+ *
+ * @param {Array} examples     {label, rawMotionData}
+ * @param {number} minPerSide  below this many trips per side, returns null
+ * @returns {{n:number, liveCorrect:number, finalCorrect:number}|null}
+ */
+export function estimateAccuracy(examples, minPerSide = 5) {
+  const trips = [], raws = [], labels = [];
+  for (const ex of examples || []) {
+    if (ex.label !== "left" && ex.label !== "right") continue;
+    const m = measureTrip(ex);
+    if (!m) continue;
+    trips.push(m); raws.push(ex.rawMotionData); labels.push(ex.label);
+  }
+  const nLeft = labels.filter((l) => l === "left").length;
+  if (nLeft < minPerSide || trips.length - nLeft < minPerSide) return null;
+
+  let liveCorrect = 0, finalCorrect = 0;
+  for (let i = 0; i < trips.length; i++) {
+    const cal = fitCalibration(trips.filter((_, j) => j !== i));
+    const raw = raws[i];
+    const end = raw[raw.length - 1].time;
+    if (cal.liveYaw && cal.liveSkew) {
+      const z = liveReadingAt(raw, end - LIVE_CAL_LEAD * 1000, cal);
+      // Same rule as the display: p = logistic(z) > 0.5 means LEFT.
+      if (z !== null && (z > 0 ? "left" : "right") === labels[i]) liveCorrect++;
+    }
+    const fv = finalVerdict(raw, cal);
+    if (fv && fv.prediction === labels[i]) finalCorrect++;
+  }
+  return { n: trips.length, liveCorrect, finalCorrect };
 }

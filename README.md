@@ -160,10 +160,12 @@ final one anchored on the arrival.
    node analyze-loocv.mjs victoria-training-YYYY-MM-DD-NLxR.json --trips
    ```
 
+After each label, the save alert shows how often the engine is right on
+your own trips, each tested with settings fitted on all the others: once
+10 s before arrival, and once after you tap Stop (from 5+ trips per side).
+
 The older k-NN / logistic-regression classifier (`classifier.js`,
-`features.js`) no longer makes the predictions you see. It still produces
-the "Estimated accuracy" in the alert after each label — which therefore
-describes that old classifier, not the fork engine.
+`features.js`) no longer makes the predictions you see.
 
 The **🧪 Test Data** button seeds 10 fake examples so the flow can be
 tested without real trips. They are marked "Fake" in their notes — delete

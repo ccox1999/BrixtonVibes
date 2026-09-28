@@ -316,18 +316,6 @@ async function loadMLModules() {
   }
 
   /**
-   * Honest accuracy estimate: average held-out accuracy over several random
-   * splits (single-split CV is too noisy on tiny sets). Returns null until
-   * there are enough examples of each class for the estimate to mean anything.
-   */
-  function estimateAccuracy(ml, examples) {
-    // Honest accuracy of the model the app will actually use: selectBestModel
-    // cross-validates both candidates and reports the winner's accuracy.
-    const sel = ml.classifier.selectBestModel(examples, 0.6);
-    return sel.accuracy ?? null;
-  }
-
-  /**
    * Generate fake training data for testing (10 examples: 5 left, 5 right).
    * Useful for validating Phase 1 & 2 without needing real motion data.
    */
@@ -541,6 +529,20 @@ async function loadMLModules() {
   }
 
   /**
+   * Every labelled trip with its raw motion data, read out of IndexedDB.
+   * Heavy (tens of MB), so callers that need it twice share one load.
+   */
+  async function loadLabelledTrips() {
+    const trips = [];
+    for (const ex of state.trainSet?.examples || []) {
+      if (!ex || !ex.label) continue;
+      const raw = await state.trainSet.getRawMotionData(ex.id);
+      if (raw && raw.length) trips.push({ label: ex.label, rawMotionData: raw });
+    }
+    return trips;
+  }
+
+  /**
    * Derive the fork engine's sign/threshold from the user's OWN labelled
    * trips. gx/gy/gz sign conventions differ between devices (see the comment
    * in handleMotion), so a hard-coded sign fitted on one phone could silently
@@ -550,16 +552,11 @@ async function loadMLModules() {
    * Runs off the hot path (app init, and after each label) because it reads
    * every raw recording out of IndexedDB. Falls back to shipped defaults.
    */
-  async function refreshForkCalibration() {
+  async function refreshForkCalibration(trips) {
     try {
       if (!state.trainSet || state.trainSet.count() < 6) return;
       const ml = await loadMLModules();
-      const examples = [];
-      for (const ex of state.trainSet.examples || []) {
-        if (!ex || !ex.label) continue;
-        const raw = await state.trainSet.getRawMotionData(ex.id);
-        if (raw && raw.length) examples.push({ label: ex.label, rawMotionData: raw });
-      }
+      const examples = trips || (await loadLabelledTrips());
       if (examples.length < 6) return;
       const cal = ml.forkEngine.calibrate(examples);
       // Only adopt a calibration that actually separates the classes; a
@@ -805,18 +802,28 @@ async function loadMLModules() {
       // Update UI
       const stats = state.trainSet.getStats();
 
-      // Honest accuracy estimate via repeated cross-validation, so the user
-      // knows whether the classifier actually works rather than guessing.
+      // The new trip sharpens the fork engine, and the user should see how
+      // good that engine — the one making the live calls — is on their own
+      // trips, each tested against the others (fork-engine.js
+      // estimateAccuracy). Both need every raw recording, so load it once.
+      // The trip is already saved, so a failure here must not surface as
+      // "Failed to save" — it only costs the accuracy line.
       let accuracyLine = "";
-      const cvAccuracy = estimateAccuracy(ml, state.trainSet.examples);
-      if (cvAccuracy !== null) {
-        const pct = (cvAccuracy * 100).toFixed(0);
-        accuracyLine =
-          cvAccuracy >= 0.75
-            ? `\n\nEstimated accuracy: ${pct}% ✓`
-            : `\n\n⚠️ Estimated accuracy: ${pct}% — collect more (and more varied) trips to improve it.`;
-      } else {
-        accuracyLine = `\n\n(Need ~5+ of each side before an accuracy estimate is meaningful.)`;
+      try {
+        const trips = await loadLabelledTrips();
+        await refreshForkCalibration(trips);
+        const acc = ml.forkEngine.estimateAccuracy(trips);
+        if (acc) {
+          const pct = (c) => `${Math.round((100 * c) / acc.n)}% (${c}/${acc.n})`;
+          accuracyLine =
+            `\n\nPrediction accuracy on your ${acc.n} trips, each tested against the others:` +
+            `\n• 10 s before arrival: ${pct(acc.liveCorrect)}` +
+            `\n• after you tap Stop: ${pct(acc.finalCorrect)}`;
+        } else {
+          accuracyLine = `\n\n(Accuracy is shown once you have 5+ trips of each side.)`;
+        }
+      } catch (err) {
+        console.warn("[fork] accuracy estimate skipped:", err);
       }
 
       alert(
@@ -1397,9 +1404,8 @@ async function loadMLModules() {
       if (state.trainSet) {
         const label = await showLabelingDialog();
         if (label && label !== "skip") {
+          // Also refreshes the fork engine's calibration with the new trip.
           await labelAndSaveToTrainingSet(label);
-          // New labelled trip -> the fork engine can sharpen its calibration.
-          refreshForkCalibration();
         }
       }
     }
@@ -1459,6 +1465,10 @@ async function loadMLModules() {
           ml.features.computeApproachProfile
         );
         await state.trainSet.save();
+        // Restored trips must reach the fork engine now, not at the next app
+        // start — otherwise a fresh install restored from a backup predicts
+        // with the shipped defaults until it is relaunched.
+        await refreshForkCalibration();
 
         await updateTrainingStatus();
 

@@ -58,7 +58,8 @@ logo to rebrand):
    pulsing red dot, live sample count, rate, and duration. About 75 s into
    the journey a **Live Platform Forecast** card starts updating every
    second (see *Platform prediction* below).
-3. **Stop Recording** — a labelling sheet appears: **← LEFT / RIGHT → / Skip**.
+3. **Stop Recording** — the forecast freezes on whatever it showed at that
+   instant, and a labelling sheet appears: **← LEFT / RIGHT → / Skip**.
 4. Pick the platform you actually arrived at. The trip's features **and**
    full raw motion are saved to localStorage automatically, an internal
    auto-backup is written, and an alert shows the new totals plus an
@@ -142,27 +143,39 @@ the phone):
   over the last 14 s.
 
 Each is compared with your own labelled trips, and the two are averaged.
-When the final braking starts, the reading is held, because later windows
-slide past the junction. Tapping **Stop** replaces the live reading with a
-final one anchored on the arrival.
+
+**Only the live call counts.** Once you tap Stop the platform is in view,
+so the app never produces an answer after the fact: tapping **Stop**
+freezes whatever was on screen the instant before.
+
+- Until the final braking, the rolling reading is shown **provisional**
+  (dimmed numbers, dashed outline). It is honestly near a coin-flip until
+  the train has crossed the junction, ~12 s before arrival.
+- When the final braking begins, the call is **frozen** and shown firm
+  ("braking — this is the call"), usually 6–9 s before the train stops.
+- If the train stops at a signal outside Brixton and then moves off
+  again, that was a wait, not the arrival: the call made there is
+  withdrawn ("moving again") and re-made on the final approach. A wait
+  looks exactly like arriving until the train moves again, so on those
+  trips the call can change after it first firms up.
+
+Measured on 35 real trips (each tested with settings fitted on the
+others), the call frozen at Stop is right **89%** of the time, and at every
+moment from 10 s before Stop onwards (full numbers in `CLAUDE.md`).
 
 1. Record a trip, then label it **left** or **right** on the sheet that
    appears when you stop.
 2. With 3+ labelled trips of each side the engine calibrates itself from
-   them (at app start and after each label). Until then it shows a rough
-   turn-only reading.
-3. The forecast is honestly near a coin-flip until the train reaches the
-   junction, ~12 s before arrival. Measured on 35 real trips, it is right
-   about **8 times in 10 at 10 s before Stop** (full numbers in
-   `CLAUDE.md`). To re-measure on your own export:
+   them (at app start, after each label, and after a restore). Until then
+   it shows a rough turn-only reading.
+3. After each label (from 5+ trips per side), the save alert replays every
+   trip through the engine exactly as the screen showed it and reports how
+   often the live call was right 12 s before arrival and when you tapped
+   Stop. To re-measure on an export:
 
    ```bash
    node analyze-loocv.mjs victoria-training-YYYY-MM-DD-NLxR.json --trips
    ```
-
-After each label, the save alert shows how often the engine is right on
-your own trips, each tested with settings fitted on all the others: once
-10 s before arrival, and once after you tap Stop (from 5+ trips per side).
 
 The older k-NN / logistic-regression classifier (`classifier.js`,
 `features.js`) no longer makes the predictions you see.

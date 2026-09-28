@@ -42,14 +42,85 @@
 
 "use strict";
 
-export const FORK_ENGINE_VERSION = 3;
+export const FORK_ENGINE_VERSION = 4;
 
 // Windows are relative to the arrival instant, in seconds before it.
 export const WIN_FINAL = [26.0, 10.0];
 export const WIN_EARLY = [22.0, 16.0];
 
 /* ------------------------------------------------------------
+   v5 — THE CALL THAT MATTERS IS THE LIVE ONE, FROZEN WHEN BRAKING STARTS
+   ------------------------------------------------------------
+   The app exists to call the platform in real time. Once Stop is tapped
+   the platform is in view and any answer is worthless, so there is no
+   post-Stop verdict any more: tapping Stop freezes whatever was on the
+   screen. The number to beat is therefore the live display at the Stop
+   tap — and v4 got that right only 66% of the time, because its rolling
+   window drifts past the junction in the last seconds and its braking
+   hold often never engaged.
+
+   THE FREEZE. The rolling reading (v4 note) is at its best when read
+   9-12 s before Stop (28-31/35 LOOCV) and worse either side (<=24 from
+   14 s out, <=26 from 7 s). So the call is frozen from the moment the
+   final braking begins: vibration below FREEZE_FRAC x cruise for
+   FREEZE_HOLD s, holding the reading taken when the low run BEGAN.
+   Cruise is the FREEZE_CRUISE_Q QUANTILE of per-second vibration, not the
+   median: a long wait outside Brixton fills the history with stationary
+   seconds, dragging a median down until the final braking never looks
+   quiet enough (v4 never froze on the final approach on 7 of 35 trips).
+   If vibration returns to
+   RELEASE_FRAC x cruise for RELEASE_HOLD s the train has moved off again
+   (that was a wait, not the arrival): the freeze is released, the screen
+   is cleared for REREAD_DELAY s while the windows refill with moving
+   data, and the rolling reading resumes until the next freeze.
+
+   HOW THE CONSTANTS WERE CHOSEN. The trigger (quantile, fraction, hold,
+   release) was chosen WITHOUT left/right labels: from a grid of 165
+   candidates, the one whose freeze reading lands 9-12 s before Stop on the
+   most trips (24/35, and 26/35 within 8-13 s; v4's hold: 13 and 17).
+   Labels were then used for three choices — FREEZE_HOLD 2 s vs 3 s, the
+   calibration (kept at Stop-10 s as in v4), and REREAD_DELAY (8 s: 12 s
+   and more cost accuracy at 10 s out) — and the whole family of 12
+   variants is covered by a best-of-family permutation test on the frozen
+   number: p = 0.0005 (2000 shuffles; best of family under shuffled labels
+   median 21/35, 95th percentile 25/35, against 31/35 real).
+
+   MEASURED, streamed through this class (analyze-loocv.mjs), LOOCV over
+   35 trips (19L/16R), calibration refit per fold, nothing shown = wrong:
+       s before Stop     16   12   10    8    6    4    2    0
+       v4 on screen      63   71   83   77   74   69   74   66 %
+       v5 on screen      60   74   91   89   89   89   89   89 %
+       v5 firm (frozen)   0    0   11   46   77   86   89   89 %
+   Prospective (calibrated on the 26 older trips, scored on the 9 newer):
+   v5 78% (7/9) at every point from 16 s to Stop; v4 78% at Stop.
+
+   HONEST LIMITS.
+   - The firm call appears 6-9 s before Stop, not at the junction (12-16 s
+     out): the braking that marks the moment only begins ~10-12 s out, and
+     a call frozen earlier reads a worse window (<=24/35 at 14 s and more).
+     Before the freeze the screen shows the rolling reading as PROVISIONAL.
+   - A wait outside Brixton (16 of 35 trips) looks exactly like arriving
+     until the train moves off again, so a freeze happens there too — and
+     that reading, taken before the junction, is a coin toss (10/19), with
+     as much apparent confidence as a real one. No sensor cue tested
+     separates the two without also depending on the platform side. So
+     on those trips the call can change after it first firms up: 0.57
+     changes per trip on average (all 20 on 14 trips that froze during a
+     wait; none on the others), against a target of 0.2.
+   - n = 35, and 9 prospective trips move the percentage in steps of 11.
+   ------------------------------------------------------------ */
+export const FREEZE_CRUISE_Q = 0.75;  // cruise = this quantile of per-second vibration
+export const FREEZE_FRAC = 0.45;      // freeze once vibration < this x cruise ...
+export const FREEZE_HOLD = 2.0;       // ... for this many seconds
+export const RELEASE_FRAC = 0.5;      // release once vibration >= this x cruise ...
+export const RELEASE_HOLD = 4.0;      // ... for this many seconds (moved off again)
+export const REREAD_DELAY = 8.0;      // s the screen stays clear after moving off
+export const REPORT_LEAD = 12.0;      // s before Stop the save pop-up reports
+
+/* ------------------------------------------------------------
    v4 LIVE PATH — rolling turn + jolt reading, held once braking starts.
+   (The reading is unchanged in v5; the hold below was replaced by the
+   v5 freeze.)
    ------------------------------------------------------------
    WHY v3 WAS REPLACED. Nine trips recorded after the v3 constants were
    fixed (examples 27-35, 5L/4R, 2026-09-08..27) are the first genuinely
@@ -75,10 +146,10 @@ export const WIN_EARLY = [22.0, 16.0];
    THE HOLD. A rolling window is best ~10 s out and then slides past the
    junction into the S-bend's swing-back, where yaw INVERTS (AUC 0.35 over
    [arr-12, arr-6]; 0.00 on the new trips). So once vibration stays below
-   BRAKE_FRAC x cruise for BRAKE_HOLD s — the final braking, 7-11 s before
+   0.55 x the MEDIAN cruise for 3 s — the final braking, 7-11 s before
    Stop on an ordinary trip — the reading taken as the decline BEGAN is
    held. Unlike the old one-shot braking latch this re-arms: vibration
-   back at HOLD_RESUME x cruise for HOLD_RESUME_SEC means the train moved
+   back at 1.0 x cruise for 5 s means the train moved
    off again (a Brixton pre-platform hold), and the hold is released. The
    5 s matters: the halt + Stop-tap disturbance lasts ~2-3 s and released
    a 3 s version on 4/35 trips; a genuine restart lasts 20 s or more.
@@ -106,11 +177,10 @@ export const WIN_EARLY = [22.0, 16.0];
    - Shown confidence is conservative (mean 69% at arrival-10 s against
      83% accuracy) and deliberately uncapped.
    - Accuracy dips again in the last few seconds (66% at the Stop tap) on
-     trips where the hold did not engage or re-engage. Tapping Stop
-     replaces it with the post-Stop verdict.
-   - The post-Stop verdict is unchanged (skew, 31/35 LOOCV) though it
-     scored 6/9 prospectively. Yaw scored 8/9 there but 28/35 overall;
-     nine trips cannot tell those apart, so it was left alone.
+     trips where the hold did not engage or re-engage. (Fixed by the v5
+     freeze. The post-Stop verdict that used to replace the display on
+     Stop — |a| skew over [arr-22, arr-8], 31/35 LOOCV but 6/9
+     prospectively — was removed in v5: the user never wants it.)
 
    TRIED FROM THE 2026-09-27 OVERHAUL PROMPT, REJECTED (same harness,
    arrival-10 s, LOOCV / prospective):
@@ -125,8 +195,6 @@ export const WIN_EARLY = [22.0, 16.0];
 export const LIVE_YAW_TRAIL = 16.0;   // s; = WIN_FINAL when read 10 s out
 export const LIVE_SKEW_TRAIL = 14.0;  // s; = [arr-24, arr-10] when read 10 s out
 export const LIVE_CAL_LEAD = 10.0;    // s before Stop the live reading is fitted at
-const HOLD_RESUME = 1.0;              // x cruise vibration = moving again
-const HOLD_RESUME_SEC = 5.0;          // s it must last to release a hold
 
 /* ------------------------------------------------------------
    v2 PRIMARY SIGNAL — skewness of |a| over [arr-22, arr-8]
@@ -264,12 +332,9 @@ export const WIN_JUNCTION = [10.0, 0.0];   // kurtosis window, rel. to detection
 export const MIN_JOURNEY = 85.0;   // s; a stop before this is never arrival
 export const AUTO_ARM_AT = 75.0;   // s; final approach becomes plausible
 
-const GRAV_TAU = 5.0;              // s, gravity lowpass
+const GRAV_TAU = 5.0;              // s, gravity lowpass (yawIntegral)
 const VIB_WIN = 2.0;               // s, vibration RMS window
-const BRAKE_TAU = 2.0;             // s, horizontal-accel lowpass
 const WARMUP = 15.0;               // s before adaptive thresholds are trusted
-const BRAKE_FRAC = 0.55;           // vibration RMS below this x cruise = slowing
-const BRAKE_HOLD = 3.0;            // s it must hold before the gate opens
 
 /* ------------------------------------------------------------
    JUNCTION-ANCHORED EARLY VERDICT — TRIED AND REVERTED, do not re-add
@@ -306,7 +371,7 @@ const BRAKE_HOLD = 3.0;            // s it must hold before the gate opens
    not LOCALISABLE. Every causal detector finds an event on every trip
    and places it within a +/-24 s band, and a window anchored that
    loosely cannot line up across trips. The arrival instant is the only
-   reference precise enough — which is why finalVerdict(), which legally
+   reference precise enough — which is why finalVerdict() (removed in v5), which legally
    knows it, is the accurate path and the live one is not.
 
    KURTOSIS, not skew, is the right statistic in this frame — and it also
@@ -344,8 +409,13 @@ const BRAKE_HOLD = 3.0;            // s it must hold before the gate opens
    ------------------------------------------------------------ */
 
 // Defaults from the 15-trip fit; calibrate() overrides scale/threshold/sign.
-const DEFAULT_CAL = { sign: 1, thrEarly: 0.255, scaleEarly: 1.27,
-                      thrFinal: 0.0, scaleFinal: 1.9 };
+const DEFAULT_CAL = { sign: 1, thrEarly: 0.255, scaleEarly: 1.27 };
+
+// q-quantile by rank (no interpolation): the value at floor(q * (n-1)).
+function quantile(xs, q) {
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.floor(q * (s.length - 1))];
+}
 
 function median(xs) {
   if (!xs.length) return 0;
@@ -570,13 +640,7 @@ export function detectJunction(samples, endT) {
  * device whose gravity axes are reported with the opposite sign cannot
  * silently invert every prediction.
  *
- * Also fits the v2 skew threshold. The skew feature does not have the
- * axis-sign ambiguity that forced self-calibration for yaw, but fitting
- * its threshold to the user's own trips still matters: the absolute skew
- * level depends on the phone's sampling rate and on how much the handset
- * is damped by a pocket versus a bare hand.
- *
- * Also fits the v4 live reading (liveYaw / liveSkew): each trip's
+ * Fits the v4 live reading (liveYaw / liveSkew): each trip's
  * TRAILING windows read LIVE_CAL_LEAD s before its own Stop — exactly what
  * the live windows read at that lead. See the v4 note.
  *
@@ -600,7 +664,6 @@ function measureTrip(ex) {
   return {
     left: ex.label === "left",
     yawFinal: yawIntegral(raw, end, WIN_FINAL[0], WIN_FINAL[1]),
-    skewFinal: magSkew(raw, end, SKEW_FINAL[0], SKEW_FINAL[1]),   // may be null
     yawLive: yawIntegral(raw, cut, LIVE_YAW_TRAIL, 0),
     skewLive: magSkew(raw, cut, LIVE_SKEW_TRAIL, 0),              // may be null
   };
@@ -608,54 +671,32 @@ function measureTrip(ex) {
 
 function fitCalibration(trips) {
   const L = [], R = [];
-  const SL = [], SR = [];       // v2 skew values, per class
   const YL = [], YR = [];       // v4 live yaw, per class
   const LSL = [], LSR = [];     // v4 live skew, per class
   for (const t of trips) {
     (t.left ? L : R).push(t.yawFinal);
-    if (t.skewFinal !== null) (t.left ? SL : SR).push(t.skewFinal);
     (t.left ? YL : YR).push(t.yawLive);
     if (t.skewLive !== null) (t.left ? LSL : LSR).push(t.skewLive);
   }
   if (L.length < 3 || R.length < 3) return { ...DEFAULT_CAL, n: L.length + R.length };
 
+  // The yaw sign and class separation over WIN_FINAL: the sign orients
+  // the v1 fallback reading, and the app adopts a calibration only when
+  // the separation shows the classes actually differ.
   const mean = (a) => a.reduce((x, y) => x + y, 0) / a.length;
   const mL = mean(L), mR = mean(R);
   const sd = Math.sqrt(0.5 * (variance(L) + variance(R))) || 1;
   const sign = mL >= mR ? 1 : -1;                 // self-calibrating
   const out = {
     sign,
-    thrFinal: (mL + mR) / 2,
-    scaleFinal: Math.max(sd, 0.4),
     thrEarly: DEFAULT_CAL.thrEarly * sign,
     scaleEarly: DEFAULT_CAL.scaleEarly,
     n: L.length + R.length,
     separation: Math.abs(mL - mR) / sd,
   };
 
-  // v2 skew calibration. Same convention as the yaw path: signSkew is
-  // chosen so that a HIGHER sign*(x - thr) means LEFT, which lets both
-  // signals share logistic() and the p>0.5 test.
-  if (SL.length >= 3 && SR.length >= 3) {
-    // MEDIAN midpoint, not mean. The classes separate cleanly, so the
-    // threshold sits in an empty gap and the only question is how stable
-    // its placement is. Measured by LOOCV over the 26 trips:
-    //   midpoint of means   92%   (p=0.0003)
-    //   midpoint of the gap 96%   (p=0.0003) but keyed to the 2 extreme trips
-    //   best split on train 96%   (p=0.0397)
-    //   MEDIAN midpoint     96%   (p=0.0003)  <- chosen
-    // Medians ignore the right tail (skew runs to +3.5 on some right
-    // trips), so one unusually violent crossing cannot drag the boundary.
-    const sL = median(SL), sR = median(SR);
-    const ssd = Math.sqrt(0.5 * (variance(SL) + variance(SR))) || 1;
-    out.signSkew = sL >= sR ? 1 : -1;
-    out.thrSkew = (sL + sR) / 2;
-    out.scaleSkew = Math.max(ssd, 0.15);
-    out.separationSkew = Math.abs(sL - sR) / ssd;
-    out.nSkew = SL.length + SR.length;
-  }
-
   // v4 live reading. Both parts or neither: the reading is their average.
+  // Median midpoints (fitLive): the right-hand class has a long tail.
   if (YL.length >= 3 && YR.length >= 3 && LSL.length >= 3 && LSR.length >= 3) {
     out.liveYaw = fitLive(YL, YR);
     out.liveSkew = fitLive(LSL, LSR);
@@ -665,8 +706,9 @@ function fitCalibration(trips) {
 
 /**
  * Sign / threshold / spread for one v4 live signal, oriented so that
- * sign * (x - thr) / sd > 0 means LEFT. Median midpoint for the reason
- * given at the skew threshold: robust to the long right-hand tail.
+ * sign * (x - thr) / sd > 0 means LEFT. Median midpoint, not mean: the
+ * right-hand class has a long tail (skew runs past +3.5 on the roughest
+ * crossings), and one violent trip should not drag the boundary.
  */
 function fitLive(L, R) {
   const mL = median(L), mR = median(R);
@@ -688,59 +730,6 @@ function logistic(x, thr, scale, sign) {
 }
 
 /**
- * Authoritative verdict for a COMPLETED recording.
- *
- * Only valid once the user has tapped Stop, because it trusts the
- * recording's own endpoint as the arrival instant — the user's protocol is
- * to stop within ~1 s of the train halting at Brixton. A live, in-progress
- * recording genuinely cannot know it has arrived (see the arrival-detection
- * note in ForkEngine.update), which is the same live/complete split the
- * app's `recordingComplete` flag already encodes.
- *
- * @param {Array} samples  full recording
- * @param {object} cal     calibration from calibrate()
- * @returns {object|null}  {score, pLeft, prediction} or null if too short
- */
-export function finalVerdict(samples, cal) {
-  const c = cal || DEFAULT_CAL;
-  if (!samples || samples.length < 2) return null;
-  const end = samples[samples.length - 1].time;
-  const durSec = (end - samples[0].time) / 1000;
-  if (durSec < WIN_FINAL[0]) return null;          // not enough approach
-
-  // v2 primary: |a| skew over [arr-22, arr-8]. LOOCV 96% on 26 trips vs
-  // ~70% for the yaw integral on the same trips. Needs a calibration
-  // fitted from the user's own labelled data (see calibrate); until that
-  // exists we fall back to the yaw rule rather than guess an absolute
-  // skew threshold, which depends on sample rate and handset damping.
-  if (c.thrSkew !== undefined && durSec >= SKEW_FINAL[0]) {
-    const sk = magSkew(samples, end, SKEW_FINAL[0], SKEW_FINAL[1]);
-    if (sk !== null) {
-      const p = logistic(sk, c.thrSkew, c.scaleSkew, c.signSkew);
-      return {
-        score: sk,
-        signal: "mag-skew",
-        pLeft: p,
-        pRight: 1 - p,
-        prediction: p > 0.5 ? "left" : "right",
-        shortJourney: durSec < MIN_JOURNEY,
-      };
-    }
-  }
-
-  const score = yawIntegral(samples, end, WIN_FINAL[0], WIN_FINAL[1]);
-  const p = logistic(score, c.thrFinal, c.scaleFinal, c.sign);
-  return {
-    score,
-    signal: "yaw-integral",
-    pLeft: p,
-    pRight: 1 - p,
-    prediction: p > 0.5 ? "left" : "right",
-    shortJourney: durSec < MIN_JOURNEY,            // caller may want to warn
-  };
-}
-
-/**
  * Streaming predictor. Feed it samples as they arrive; ask it for the
  * current verdict. All state is causal — nothing looks ahead.
  */
@@ -748,97 +737,97 @@ export class ForkEngine {
   constructor(cal) {
     this.cal = cal || DEFAULT_CAL;
     this.t0 = null;
-    this.tLast = null;
-    this.g = null;
-    this.aH = [0, 0, 0];
     this.vib = [];        // {t, mag}
     this.rmsSamples = []; // 1 Hz, for the running cruise level
     this.rmsNext = 0;
-    this.cruise = null;   // median of rmsSamples, refreshed at 1 Hz
+    this.cruise = null;   // FREEZE_CRUISE_Q quantile of rmsSamples, refreshed at 1 Hz
     this.armed = false;
-    // v4 braking hold — see the v4 note. Vibration energy falls with
-    // speed, which is orientation-invariant and needs no heading reference.
-    this.lowSince = null;   // ms, start of the current below-BRAKE_FRAC run
-    this.highSince = null;  // ms, start of the current back-at-cruise run
-    this.lowStartZ = null;  // live reading as that low run began
-    this.lastZ = null;      // most recent live reading
-    this.held = null;       // held reading, or null when live
-    this.braking = false;   // true while a hold is engaged
+    // v5 freeze — see the v5 note. Vibration energy falls with speed,
+    // which is orientation-invariant and needs no heading reference.
+    this.frozen = false;
+    this.lowSince = null;   // ms, start of the current below-FREEZE_FRAC run
+    this.highSince = null;  // ms, start of the current moving-again run
+    this.readAt = null;     // ms, instant whose reading the freeze holds
+    this.frozenZ = null;    // that reading, computed at the next verdict
+    this.releasedAt = null; // ms, when the last freeze was released
   }
 
   /**
    * @param {object} s   one motion sample
    * @param {Array} all  the full sample buffer (for window integrals)
-   * @returns {object} {phase, pLeft, prediction, elapsed, armed, braking}
-   *   phase: "waiting" | "provisional" (rolling reading) | "held" (braking
-   *   hold) | "early" (v1 yaw fallback before there is a calibration)
+   * @returns {object} {phase, pLeft, prediction, elapsed, armed, frozen}
+   *   phase: "waiting"     nothing new to show (the display keeps the last)
+   *          "provisional" the rolling reading; not a firm call
+   *          "firm"        the call frozen as braking began
+   *          "cleared"     the train moved off after a wait; clear the
+   *                        screen until the reading has refilled
+   *          "early"       v1 yaw fallback before there is a calibration
    */
   update(s, all, computeVerdict = true) {
     const t = s.time;
-    if (this.t0 === null) { this.t0 = t; this.tLast = t; }
-    const dt = Math.max((t - this.tLast) / 1000, 0);
-    this.tLast = t;
+    if (this.t0 === null) this.t0 = t;
     const elapsed = (t - this.t0) / 1000;
 
-    // gravity + horizontal acceleration
-    const gv = [s.gx || 0, s.gy || 0, s.gz || 0];
-    if (!this.g) this.g = gv.slice();
-    const ag = Math.min(dt / GRAV_TAU, 1);
-    for (let k = 0; k < 3; k++) this.g[k] += ag * (gv[k] - this.g[k]);
-    const gn = Math.hypot(...this.g) || 1;
-    const ghat = this.g.map((c) => c / gn);
-    const acc = [s.ax || 0, s.ay || 0, s.az || 0];
-    const adg = acc[0] * ghat[0] + acc[1] * ghat[1] + acc[2] * ghat[2];
-    const ah = acc.map((a, i) => a - adg * ghat[i]);
-    const ab = Math.min(dt / BRAKE_TAU, 1);
-    for (let k = 0; k < 3; k++) this.aH[k] += ab * (ah[k] - this.aH[k]);
-
-    // vibration RMS over a trailing window, and the running cruise level
-    const amag = Math.hypot(...acc);
+    // Vibration RMS over a trailing window, and the running cruise level.
+    // Plain loops, not map/reduce: this runs on every sample (and ~9000
+    // times per trip when the save pop-up replays past trips), and the
+    // summation order — hence every result — is the same either way.
+    const amag = Math.hypot(s.ax || 0, s.ay || 0, s.az || 0);
     this.vib.push({ t, mag: amag });
     while (this.vib.length && this.vib[0].t < t - VIB_WIN * 1000) this.vib.shift();
-    const vals = this.vib.map((v) => v.mag);
-    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-    const rms = Math.sqrt(vals.reduce((a, b) => a + (b - mean) * (b - mean), 0) / vals.length);
+    const nv = this.vib.length;
+    let sum = 0;
+    for (let k = 0; k < nv; k++) sum += this.vib[k].mag;
+    const mean = sum / nv;
+    let ss = 0;
+    for (let k = 0; k < nv; k++) { const d = this.vib[k].mag - mean; ss += d * d; }
+    const rms = Math.sqrt(ss / nv);
     if (elapsed >= this.rmsNext && elapsed >= 5) {
       this.rmsSamples.push(rms);
       this.rmsNext = elapsed + 1;
       // Sorted once a second here rather than on every sample.
-      if (this.rmsSamples.length >= 10 && elapsed >= WARMUP) this.cruise = median(this.rmsSamples);
+      if (this.rmsSamples.length >= 10 && elapsed >= WARMUP) {
+        this.cruise = quantile(this.rmsSamples, FREEZE_CRUISE_Q);
+      }
     }
 
     if (!this.armed && elapsed >= AUTO_ARM_AT) this.armed = true;
 
-    // v4 braking hold. Engage: vibration below BRAKE_FRAC x cruise for
-    // BRAKE_HOLD s, holding the reading from when the decline BEGAN (the
-    // trailing window then still covers the junction). Release: back at
-    // HOLD_RESUME x cruise for HOLD_RESUME_SEC — the train moved off again,
-    // so that was a pre-platform hold, not the final approach.
+    // v5 freeze. Freeze: vibration below FREEZE_FRAC x cruise for
+    // FREEZE_HOLD s — the final braking — holding the reading from when the
+    // low run BEGAN. Release: back to RELEASE_FRAC x cruise for RELEASE_HOLD
+    // s — the train moved off again, so that was a wait outside Brixton.
     //
-    // There is deliberately no live ARRIVAL detector any more. The old one
-    // (quiet for 1.5 s after MIN_JOURNEY) almost never fired because the
-    // user taps Stop within ~1 s of the halt, and could fire on a Brixton
-    // pre-platform hold. finalVerdict() owns the arrival once Stop is tapped.
-    const ratio = this.cruise ? rms / this.cruise : 1;
-    if (this.armed && this.cruise && ratio < BRAKE_FRAC) {
-      if (this.lowSince === null) { this.lowSince = t; this.lowStartZ = this.lastZ; }
-    } else {
-      this.lowSince = null;
+    // There is deliberately no ARRIVAL detector: the user taps Stop within
+    // ~1 s of the halt, and a wait looks like an arrival until it ends.
+    if (this.armed && this.cruise) {
+      if (!this.frozen) {
+        if (rms < FREEZE_FRAC * this.cruise) {
+          if (this.lowSince === null) this.lowSince = t;
+        } else {
+          this.lowSince = null;
+        }
+        if (this.lowSince !== null && t - this.lowSince >= FREEZE_HOLD * 1000) {
+          this.frozen = true;
+          this.readAt = this.lowSince;
+          this.frozenZ = null;      // read at the next verdict (needs `all`)
+          this.highSince = null;
+        }
+      } else {
+        if (rms >= RELEASE_FRAC * this.cruise) {
+          if (this.highSince === null) this.highSince = t;
+        } else {
+          this.highSince = null;
+        }
+        if (this.highSince !== null && t - this.highSince >= RELEASE_HOLD * 1000) {
+          this.frozen = false;
+          this.lowSince = null;
+          this.readAt = null;
+          this.frozenZ = null;
+          this.releasedAt = t;
+        }
+      }
     }
-    if (this.cruise && ratio >= HOLD_RESUME) {
-      if (this.highSince === null) this.highSince = t;
-    } else {
-      this.highSince = null;
-    }
-    if (this.held !== null && this.highSince !== null &&
-        t - this.highSince >= HOLD_RESUME_SEC * 1000) {
-      this.held = null;
-    }
-    if (this.held === null && this.lowSince !== null && this.lowStartZ !== null &&
-        t - this.lowSince >= BRAKE_HOLD * 1000) {
-      this.held = this.lowStartZ;
-    }
-    this.braking = this.held !== null;
 
     // ---- verdict
     // The state machine above must see every sample, but the window integral
@@ -849,15 +838,25 @@ export class ForkEngine {
     let phase = "waiting", score = 0, p = 0.5;
     const c = this.cal;
     if (this.armed && c.liveYaw && c.liveSkew) {
-      // v4. The reading is refreshed even while held, so a released hold
-      // (or the next low run) starts from a current value, not a stale one.
-      const z = this.liveReading(all, t);
-      if (z !== null) this.lastZ = z;
-      if (this.held !== null) { phase = "held"; score = this.held; }
-      else if (z !== null) { phase = "provisional"; score = z; }
+      if (this.frozen) {
+        // Read once, at the first verdict after the freeze. The reading
+        // only uses samples up to readAt, which is in the past.
+        if (this.frozenZ === null) this.frozenZ = liveReadingAt(all, this.readAt, c);
+        if (this.frozenZ !== null) { phase = "firm"; score = this.frozenZ; }
+      }
+      if (phase === "waiting") {
+        if (this.releasedAt !== null && t - this.releasedAt < REREAD_DELAY * 1000) {
+          // Moved off after a wait: the windows still hold the stationary
+          // wait, and the rolling reading flickers until they refill.
+          phase = "cleared";
+        } else {
+          const z = this.liveReading(all, t);
+          if (z !== null) { phase = "provisional"; score = z; }
+        }
+      }
       // The average of two z-scores, used directly as log-odds. No cap:
       // measured, it is if anything under-confident (see the v4 note).
-      if (phase !== "waiting") p = logistic(score, 0, 1, 1);
+      if (phase === "firm" || phase === "provisional") p = logistic(score, 0, 1, 1);
     } else if (this.armed) {
       // No live calibration yet (fewer than 3 labelled trips per side).
       // Fall back to the v1 yaw reading so a fresh install still shows
@@ -875,7 +874,7 @@ export class ForkEngine {
       prediction: p > 0.5 ? "left" : "right",
       elapsed,
       armed: this.armed,
-      braking: this.braking,
+      frozen: this.frozen,
     };
   }
 
@@ -909,23 +908,62 @@ export function liveReadingAt(samples, t, cal) {
 }
 
 /**
- * How often this engine is right on the user's own trips, each trip
- * tested with a calibration fitted on all the OTHERS (leave-one-out), so
- * no trip grades itself. Shown to the user after each label.
+ * Replay a finished recording through a fresh ForkEngine exactly as the
+ * app runs it live — every sample through the state machine, one verdict
+ * per second of sample time — and return what the SCREEN showed each
+ * second. The display rules are makeLivePrediction()'s: a "waiting"
+ * verdict leaves the last reading on screen, a "cleared" one blanks it.
  *
- *   liveCorrect   the rolling live reading LIVE_CAL_LEAD (10) s before
- *                 Stop. It ignores the braking hold, which can replace
- *                 that reading on screen; on the 35-trip set both came to
- *                 29/35. analyze-loocv.mjs measures the fully streamed
- *                 display.
- *   finalCorrect  the post-Stop verdict (finalVerdict).
+ * Passing the whole recording is causal: every window reads only samples
+ * at or before the instant being evaluated.
  *
- * Each trip is measured once and only the fitting is repeated per fold,
- * so this is cheap enough to run on the phone after every label.
+ * @param {Array} samples  a finished recording
+ * @param {object} cal     calibration from calibrate()
+ * @returns {Array<{t:number, shown:({prediction:string, pLeft:number,
+ *          phase:string}|null)}>}  one entry per second; the last entry is
+ *          what was on screen when Stop was tapped
+ */
+export function replayDisplay(samples, cal) {
+  const engine = new ForkEngine(cal);
+  const out = [];
+  let shown = null;
+  let nextTick = samples[0].time + 1000;
+  const last = samples.length - 1;
+  for (let i = 0; i <= last; i++) {
+    const s = samples[i];
+    const tick = s.time >= nextTick || i === last;
+    const v = engine.update(s, samples, tick);
+    if (!tick) continue;
+    while (nextTick <= s.time) nextTick += 1000;
+    if (v.phase === "cleared") shown = null;
+    else if (v.phase !== "waiting") shown = { prediction: v.prediction, pLeft: v.pLeft, phase: v.phase };
+    out.push({ t: s.time, shown });
+  }
+  return out;
+}
+
+/** What `replayDisplay` had on screen `lead` seconds before the end. */
+export function shownAt(timeline, lead) {
+  const cut = timeline[timeline.length - 1].t - lead * 1000;
+  let rec = null;
+  for (const r of timeline) { if (r.t <= cut) rec = r; else break; }
+  return rec ? rec.shown : null;
+}
+
+/**
+ * How often the LIVE display is right on the user's own trips, each trip
+ * replayed (replayDisplay) with a calibration fitted on all the OTHERS
+ * (leave-one-out), so no trip grades itself. Shown after each label.
+ *
+ *   atJunctionCorrect  on screen REPORT_LEAD (12) s before Stop
+ *   atStopCorrect      on screen when Stop was tapped — the frozen number
+ *
+ * Nothing on screen counts as wrong. Each trip's calibration values are
+ * measured once and only the fitting is repeated per fold.
  *
  * @param {Array} examples     {label, rawMotionData}
  * @param {number} minPerSide  below this many trips per side, returns null
- * @returns {{n:number, liveCorrect:number, finalCorrect:number}|null}
+ * @returns {{n:number, atJunctionCorrect:number, atStopCorrect:number}|null}
  */
 export function estimateAccuracy(examples, minPerSide = 5) {
   const trips = [], raws = [], labels = [];
@@ -938,18 +976,14 @@ export function estimateAccuracy(examples, minPerSide = 5) {
   const nLeft = labels.filter((l) => l === "left").length;
   if (nLeft < minPerSide || trips.length - nLeft < minPerSide) return null;
 
-  let liveCorrect = 0, finalCorrect = 0;
+  let atJunctionCorrect = 0, atStopCorrect = 0;
   for (let i = 0; i < trips.length; i++) {
     const cal = fitCalibration(trips.filter((_, j) => j !== i));
-    const raw = raws[i];
-    const end = raw[raw.length - 1].time;
-    if (cal.liveYaw && cal.liveSkew) {
-      const z = liveReadingAt(raw, end - LIVE_CAL_LEAD * 1000, cal);
-      // Same rule as the display: p = logistic(z) > 0.5 means LEFT.
-      if (z !== null && (z > 0 ? "left" : "right") === labels[i]) liveCorrect++;
-    }
-    const fv = finalVerdict(raw, cal);
-    if (fv && fv.prediction === labels[i]) finalCorrect++;
+    const tl = replayDisplay(raws[i], cal);
+    const junction = shownAt(tl, REPORT_LEAD);
+    const stop = tl[tl.length - 1].shown;
+    if (junction && junction.prediction === labels[i]) atJunctionCorrect++;
+    if (stop && stop.prediction === labels[i]) atStopCorrect++;
   }
-  return { n: trips.length, liveCorrect, finalCorrect };
+  return { n: trips.length, atJunctionCorrect, atStopCorrect };
 }

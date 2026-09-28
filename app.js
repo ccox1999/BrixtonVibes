@@ -577,6 +577,7 @@ async function loadMLModules() {
    * (throttled by renderFrame).
    */
   async function makeLivePrediction() {
+    if (!state.recording) return;       // Stop freezes the display
     if (state.data.length < 30) return; // need at least 0.5s of data
 
     try {
@@ -603,20 +604,33 @@ async function loadMLModules() {
       }
       state.forkFedUpTo = state.data.length;
 
+      // Stop was tapped while this update was in flight. The screen is
+      // frozen on what it showed at the tap — never repaint it afterwards.
+      if (!state.recording) return;
+
+      if (forkOut && forkOut.phase === "cleared") {
+        // The train moved off after a wait outside Brixton. The call made
+        // during the wait came from before the junction, so withdraw it
+        // until the reading has refilled with motion (fork-engine.js v5).
+        state.lastLivePrediction = null;
+        clearForecastPodium();
+        setForecastStyle("provisional");
+        ui.forecastNote.textContent = "moving again — re-reading the approach…";
+        return;
+      }
       if (forkOut && forkOut.phase !== "waiting") {
+        // "firm" is the call frozen as the final braking began; everything
+        // before it is the rolling reading, honestly near chance until the
+        // junction has been crossed, and styled as provisional.
+        const firm = forkOut.phase === "firm";
         state.lastLivePrediction = {
-          pLeft: forkOut.pLeft, pRight: forkOut.pRight, source: "fork-engine",
+          pLeft: forkOut.pLeft, pRight: forkOut.pRight, source: "fork-engine", firm,
         };
         updateForecastPodium(forkOut.pLeft * 100, forkOut.pRight * 100);
-        // "provisional" is honestly near chance until ~12 s before arrival
-        // (the junction is not yet crossed); "held" is the reading frozen as
-        // the final braking began. See the v4 note in fork-engine.js.
-        ui.forecastNote.textContent =
-          forkOut.phase === "held"
-            ? "braking — reading held"
-            : forkOut.phase === "provisional"
-              ? "approach — provisional, firms up ~10 s out"
-              : "provisional reading";
+        setForecastStyle(firm ? "firm" : "provisional");
+        ui.forecastNote.textContent = firm
+          ? "braking — this is the call"
+          : "provisional — firms up as the train brakes";
         return;
       }
       // Before the route prior arms (first ~75 s) there is no fork evidence
@@ -689,6 +703,21 @@ async function loadMLModules() {
       hapticTick(12);
     }
     state.lastDisplayedLeader = leader;
+  }
+
+  /** Blank both podium rows (a withdrawn call); the rows keep their order. */
+  function clearForecastPodium() {
+    ui.forecastLeft.querySelector(".forecast-percentage").textContent = "—";
+    ui.forecastRight.querySelector(".forecast-percentage").textContent = "—";
+  }
+
+  /**
+   * "provisional": the rolling reading, drawn dimmed so it never looks like
+   * a call. "firm": the call frozen as the final braking began.
+   */
+  function setForecastStyle(kind) {
+    ui.liveForcastCard.classList.toggle("is-firm", kind === "firm");
+    ui.liveForcastCard.classList.toggle("is-provisional", kind === "provisional");
   }
 
   /**
@@ -803,11 +832,11 @@ async function loadMLModules() {
       const stats = state.trainSet.getStats();
 
       // The new trip sharpens the fork engine, and the user should see how
-      // good that engine — the one making the live calls — is on their own
-      // trips, each tested against the others (fork-engine.js
-      // estimateAccuracy). Both need every raw recording, so load it once.
-      // The trip is already saved, so a failure here must not surface as
-      // "Failed to save" — it only costs the accuracy line.
+      // good its LIVE call is on their own trips: each one replayed through
+      // the engine exactly as the screen showed it, calibrated on the others
+      // (fork-engine.js estimateAccuracy). Both need every raw recording, so
+      // load it once. The trip is already saved, so a failure here must not
+      // surface as "Failed to save" — it only costs the accuracy line.
       let accuracyLine = "";
       try {
         const trips = await loadLabelledTrips();
@@ -816,9 +845,9 @@ async function loadMLModules() {
         if (acc) {
           const pct = (c) => `${Math.round((100 * c) / acc.n)}% (${c}/${acc.n})`;
           accuracyLine =
-            `\n\nPrediction accuracy on your ${acc.n} trips, each tested against the others:` +
-            `\n• 10 s before arrival: ${pct(acc.liveCorrect)}` +
-            `\n• after you tap Stop: ${pct(acc.finalCorrect)}`;
+            `\n\nLive call on your ${acc.n} trips, each tested against the others:` +
+            `\n• ${ml.forkEngine.REPORT_LEAD} s before arrival: ${pct(acc.atJunctionCorrect)}` +
+            `\n• frozen when you tapped Stop: ${pct(acc.atStopCorrect)}`;
         } else {
           accuracyLine = `\n\n(Accuracy is shown once you have 5+ trips of each side.)`;
         }
@@ -1333,6 +1362,7 @@ async function loadMLModules() {
     ui.forecastLeft.querySelector(".forecast-percentage").textContent = "\u2014";
     ui.forecastRight.querySelector(".forecast-percentage").textContent = "\u2014";
     ui.forecastNote.textContent = "Waiting for data\u2026";
+    setForecastStyle("provisional");   // nothing is firm until the braking freeze
 
     hapticTick(15);
     updateSessionInfo();
@@ -1357,28 +1387,17 @@ async function loadMLModules() {
 
     const hasData = state.data.length > 0;
 
-    // Authoritative verdict: now that the user has tapped Stop, the recording's
-    // own endpoint IS the arrival (their protocol is to stop within ~1 s of the
-    // train halting), so the fork window can be anchored exactly. A live
-    // recording cannot know this — the same live/complete split the feature
-    // extractor's `recordingComplete` flag encodes.
-    let finalShown = false;
-    if (hasData) {
-      try {
-        const ml = await loadMLModules();
-        const fv = ml.forkEngine.finalVerdict(state.data, state.forkCal);
-        if (fv) {
-          updateForecastPodium(fv.pLeft * 100, fv.pRight * 100);
-          ui.forecastNote.textContent = fv.shortJourney
-            ? "final reading (short trip — treat with caution)"
-            : "final reading, anchored on arrival";
-          finalShown = true;
-        }
-      } catch (err) {
-        console.warn("[fork] final verdict failed:", err);
-      }
+    // Tapping Stop FREEZES the live call: whatever was on screen the instant
+    // before stays there, untouched. There is deliberately no post-Stop
+    // verdict — by now the platform is in view, so a better answer would be
+    // worthless; the app exists to call it before anyone can see.
+    if (hasData && state.lastLivePrediction) {
+      ui.forecastNote.textContent = state.lastLivePrediction.firm
+        ? "frozen when you tapped Stop"
+        : "frozen when you tapped Stop (it had not firmed up yet)";
+    } else {
+      ui.liveForcastCard.classList.add("hidden");
     }
-    if (!finalShown) ui.liveForcastCard.classList.add("hidden");
 
     setSessionState(hasData ? "Recorded" : "Idle");
     ui.clearBtn.disabled = !hasData;

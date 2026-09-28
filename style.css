@@ -499,6 +499,14 @@ body {
   text-align: center;
 }
 
+/* Provisional (the rolling reading before the braking freeze): readable,
+   but visibly NOT a call — dimmed numbers, dashed outline. Firm (the call
+   frozen as the final braking began): full strength, heavier outline. */
+.forecast-card.is-provisional .forecast-percentage { opacity: 0.45; }
+.forecast-card.is-provisional .forecast-position.rank-top { border-style: dashed; }
+.forecast-card.is-firm .forecast-position.rank-top { border-width: 2px; }
+.forecast-card.is-firm .forecast-note { color: var(--text-main); font-weight: 600; }
+
 /* Modal for labeling (CSP-safe, no inline styles) */
 
 .modal-overlay {

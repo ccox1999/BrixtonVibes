@@ -28,8 +28,8 @@
     <meta name="format-detection" content="telephone=no" />
     <link rel="apple-touch-icon" href="apple-touch-icon.png" />
     <link rel="icon" type="image/png" href="icon-192.png" />
-    <link rel="stylesheet" href="style.css" />
-    <script src="app.js" defer></script>
+    <link rel="stylesheet" href="style.css?v=42" />
+    <script type="module" src="app-bootstrap.js?v=42"></script>
   </head>
   <body>
     <noscript
@@ -46,7 +46,7 @@
               STOCKWELL <span aria-hidden="true">→</span> BRIXTON
             </p>
           </div>
-          <span class="line-badge">VICTORIA</span>
+          <span class="line-badge">VICTORIA · v42</span>
         </header>
         <section
           id="liveForcastCard"
@@ -136,7 +136,7 @@
           </p>
         </section>
         <details class="tools-group card" id="toolsGroup">
-          <summary>Recordings &amp; settings</summary>
+          <summary>Recordings &amp; settings · v42</summary>
           <div class="tools-body">
             <div id="trainingStatus" class="training-status-text"></div>
             <p id="cloudStatus" class="save-status">
@@ -190,6 +190,10 @@
         </div>
         <div id="recordingsList" class="recordings-list"></div>
       </section>
+    </div>
+    <div id="updateNotice" class="update-notice hidden" role="status">
+      <span>An app update is ready. Your recording is saved.</span>
+      <button id="applyUpdateBtn" type="button" class="btn">Load update</button>
     </div>
   </body>
 </html>

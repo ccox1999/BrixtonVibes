@@ -1,24 +1,14 @@
-/* ============================================================
-   BrixtonVibes — service worker (optional file)
-   ------------------------------------------------------------
-   Simple offline app shell. Useful on the tube, where this app
-   is most likely to be used and connectivity is worst.
-
-   IMPORTANT: bump CACHE_VERSION whenever you edit any file in
-   APP_SHELL, otherwise returning visitors keep the old cached
-   copy until the background refresh lands.
-   ============================================================ */
-
+/* One coherent offline app release. Never deletes recording databases or
+ * localStorage. Boot/recovery code installs a release before loading the app. */
 "use strict";
-
-const CACHE_VERSION = "brixtonvibes-v41";
-
-// Everything the app needs to boot with no network at all.
+const CACHE_VERSION = "brixtonvibes-v42";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./style.css",
-  "./app.js",
+  "./style.css?v=42",
+  "./app-bootstrap.js?v=42",
+  "./app.js?v=42",
   "./features.js",
   "./classifier.js",
   "./training-set.js",
@@ -34,68 +24,73 @@ const APP_SHELL = [
   "./icon-512.png",
   "./apple-touch-icon.png",
 ];
+const SHELL_URLS = new Set(
+  APP_SHELL.map((path) => new URL(path, self.registration.scope).href),
+);
 
-// Install: pre-cache the shell, then activate immediately rather than
-// waiting for every old tab to close.
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches
-      .open(CACHE_VERSION)
-      .then((cache) => cache.addAll(APP_SHELL))
-      .then(() => self.skipWaiting())
+    caches.open(CACHE_VERSION).then(async (cache) => {
+      // A new cache name alone is insufficient: the browser HTTP cache could
+      // otherwise fill it with the previous release's HTML/JavaScript.
+      await cache.addAll(
+        APP_SHELL.map(
+          (path) =>
+            new Request(new URL(path, self.registration.scope), {
+              cache: "reload",
+            }),
+        ),
+      );
+      await self.skipWaiting();
+    }),
   );
 });
-
-// Activate: delete caches from previous versions and take control of
-// any pages that are already open.
 self.addEventListener("activate", (event) => {
   event.waitUntil(
-    caches
-      .keys()
-      .then((keys) =>
-        Promise.all(
-          keys
-            .filter((key) => key.startsWith('brixtonvibes-') && key !== CACHE_VERSION)
-            .map((key) => caches.delete(key))
-        )
-      )
-      .then(() => self.clients.claim())
+    (async () => {
+      const names = await caches.keys();
+      await Promise.all(
+        names
+          .filter(
+            (name) =>
+              name.startsWith("brixtonvibes-") && name !== CACHE_VERSION,
+          )
+          .map((name) => caches.delete(name)),
+      );
+      // Taking control does not navigate/reload existing clients. In particular
+      // an old recording tab must continue undisturbed until its user finishes.
+      await self.clients.claim();
+    })(),
   );
 });
-
-// Fetch: one coherent cached app shell. A bumped worker installs the next
-// complete version. API/auth responses never enter the cache.
 self.addEventListener("fetch", (event) => {
-  const { request } = event;
-
-  // Only handle same-origin GETs; let everything else pass through.
-  if (request.method !== "GET") return;
-  if (new URL(request.url).origin !== self.location.origin) return;
-  if (new URL(request.url).pathname.startsWith('/api/')) return;
-
+  const request = event.request,
+    url = new URL(request.url);
+  if (request.method !== "GET" || url.origin !== self.location.origin) return;
+  if (
+    url.pathname.includes("/api/") ||
+    /\/(update\.html|update\.js)$/.test(url.pathname)
+  )
+    return;
+  if (request.mode === "navigate") {
+    event.respondWith(
+      (async () => {
+        try {
+          const response = await fetch(request, { cache: "no-store" });
+          if (response.ok) return response;
+        } catch {
+          /* Offline: retain the complete cached release. */
+        }
+        const cache = await caches.open(CACHE_VERSION);
+        return (await cache.match("./index.html")) || Response.error();
+      })(),
+    );
+    return;
+  }
+  if (!SHELL_URLS.has(url.href)) return;
   event.respondWith(
-    caches.match(request).then((cached) => {
-      // Shell files belong to one version. Mixing background-refreshed modules
-      // with an older app can break recordings; updates install atomically.
-      if (cached) return cached;
-      // Refresh the cache in the background (ignore failures — offline).
-      const refresh = fetch(request)
-        .then((response) => {
-          if (response && response.ok) {
-            const copy = response.clone();
-            caches.open(CACHE_VERSION).then((cache) => cache.put(request, copy));
-          }
-          return response;
-        })
-        .catch(() => undefined);
-
-      // Nothing cached: wait for the network, and for page navigations
-      // fall back to the cached shell so the app still opens offline.
-      return refresh.then((response) => {
-        if (response) return response;
-        if (request.mode === "navigate") return caches.match("./index.html");
-        return Response.error();
-      });
-    })
+    caches
+      .open(CACHE_VERSION)
+      .then(async (cache) => (await cache.match(request)) || fetch(request)),
   );
 });

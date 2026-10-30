@@ -201,6 +201,7 @@ async function loadMLModules() {
     nativeSave: null,
     nativeRecordId: null,
     nativePreparation: 0,
+    latestRecordingDurable: false,
   };
 
   // ---------- Small helpers ------------------------------------------------
@@ -936,6 +937,7 @@ async function loadMLModules() {
     const work = state.journalPending.catch(() => {}).then(async () => {
       if (!state.sync) throw new Error('Local recording store unavailable');
       await state.sync.saveRecording(payload);
+      if (complete) state.latestRecordingDurable = true;
       state.memoryUnsaved = false;
       document.getElementById('emergencyDownload')?.remove();
       document.getElementById('retryLocalSave')?.remove();
@@ -1530,6 +1532,7 @@ async function loadMLModules() {
     if (state.finishing) return;
     if (state.memoryUnsaved) { showSaveError(new Error('Download or retry saving the current recording before starting another.')); return; }
     state.recordingId = crypto.randomUUID();
+    state.latestRecordingDurable = false;
     state.position = null;
     state.trackView?.render(null,null);
     state.tracker = mlModules ? new mlModules.position.TrackPosition(state.trackReference || mlModules.reference.TRACK_REFERENCE) : null;
@@ -1689,6 +1692,7 @@ async function loadMLModules() {
     ui.recordLabel.textContent = 'Start recording';
     ui.saveOneDriveBtn.disabled=!state.nativeSave?.supported();
     await renderLocalRecordings();
+    window.dispatchEvent(new Event('brixton:idle'));
   }
 
   ui.recordBtn.addEventListener("click", () => {
@@ -1800,6 +1804,7 @@ async function loadMLModules() {
     ui.clearBtn.disabled = true;
     updateSessionInfo();
     scheduleRender();
+    window.dispatchEvent(new Event('brixton:idle'));
   });
 
   // ---------- Lifecycle ----------------------------------------------------
@@ -1821,20 +1826,6 @@ async function loadMLModules() {
       scheduleRender();
     }
   });
-
-  // Optional offline support — registers sw.js if it exists; fails quietly
-  // (with an info log) if the file hasn't been added to the repo.
-  function registerServiceWorker() {
-    if ("serviceWorker" in navigator && window.isSecureContext) {
-      const register = () => {
-        navigator.serviceWorker.register("./sw.js").catch((err) => {
-          console.info("[MotionLab] Offline mode unavailable (no service worker):", err.message);
-        });
-      };
-      if (document.readyState === 'complete') register();
-      else window.addEventListener('load', register, {once:true});
-    }
-  }
 
   // ---------- Init ---------------------------------------------------------
 
@@ -1882,7 +1873,6 @@ async function loadMLModules() {
     }
 
     await initJourneyTools();
-    registerServiceWorker();
     requestPersistentStorage(); // ask iOS not to evict our recordings
     setupResizeHandling();
     updateSessionInfo();

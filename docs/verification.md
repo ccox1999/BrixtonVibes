@@ -8,6 +8,7 @@ or has been created. The earlier backend dry-run is an inactive optional design.
 | --- | --- |
 | Automated algorithm, position, journal, native save and security tests | 40 passed, none failed |
 | Edge application replay and failure checks | 27 passed, none failed |
+| Real v38 → v42 offline installation migration | 19 passed, none failed |
 | Real IndexedDB migration and interrupted transaction | Passed; legacy samples preserved, no partial write |
 | iPhone-sized viewports | 320×568, 375×667, 390×664, 390×844, 430×932 |
 | Visual inspection | Screenshots inspected and refined; Finish/save status remain visible during capture |
@@ -30,6 +31,14 @@ the user gesture is active, the full raw JSON is attached, cancellation allows
 retry, the local copy survives, no cloud success is claimed, and a saved file
 is prepared again after reload. A native-only test confirms there are zero
 backend/authentication requests.
+
+`tools/test-update.mjs` installs the actual old v38 code in an isolated browser
+profile before serving the current release. It verifies that migration through
+the dedicated update page reaches the real track SVG, labels and raw samples
+survive, active old/current recordings keep running across worker changes, idle
+updates reload safely, an explicitly applied post-Finish update preserves the
+completed recording, and offline startup remains functional. This tests the
+previously missed old-installation path, rather than only fresh browsers.
 
 The journal browser test migrates a real IndexedDB v1 fixture with 22,000 samples
 to v2, confirms compact metadata, and aborts the second store write deliberately:

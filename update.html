@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en" data-app-updater>
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; object-src 'none'; base-uri 'none'"
+    />
+    <meta name="theme-color" content="#080e18" />
+    <title>Update BrixtonVibes</title>
+    <link rel="stylesheet" href="style.css?v=42" />
+    <script type="module" src="update.js?v=42"></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="card">
+        <h1>Updating BrixtonVibes</h1>
+        <p id="updateStatus" role="status">
+          Downloading the current app. Your saved journeys stay on this device.
+        </p>
+        <p class="diagnostic-note">
+          This updates app files only. It does not clear recordings, labels or
+          training data.
+        </p>
+        <button id="retryUpdateBtn" class="btn hidden" type="button">
+          Retry update
+        </button>
+        <a class="btn" href="./?release=42">Open app</a>
+      </section>
+    </main>
+  </body>
+</html>

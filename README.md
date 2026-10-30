@@ -111,8 +111,19 @@ Actual iOS/OneDrive delivery still needs a physical phone test.
 
 Existing storage names `victoria-line-training-set` and `motion-lab-raw` remain
 unchanged. The independent journal uses `brixtonvibes-recording-outbox`.
-Bump `CACHE_VERSION` in `sw.js` whenever app assets change. API and authentication
-responses bypass the service worker; shell modules stay within one cache version.
+
+If an older installation still shows the chart dashboard, open
+[`update.html?release=42`](https://ccox1999.github.io/BrixtonVibes/update.html?release=42)
+while not recording. It installs the current app files and reopens the app;
+it never clears saved recordings, labels, localStorage or IndexedDB.
+
+Release updates bump `CACHE_VERSION` in `sw.js`, `RELEASE` in
+`app-bootstrap.js`, and their version URLs in `index.html`, `update.html`,
+`update.js` and the precache list together. The bootstrap waits for the coherent
+release before loading app code. Navigation checks the network when online;
+offline uses the completed cached release. Updates do not navigate active
+recording tabs. A finished saved session offers a safe Load update control.
+API/authentication and recovery-page responses bypass offline caching.
 
 ## Reproducing checks
 
@@ -124,6 +135,7 @@ not steps required to use the app):
 npm install
 npm test
 npm run test:browser
+npm run test:update
 node analyze-development.mjs victoria-training-2026-09-27-19L16R.json victoria-training-2026-10-30-21L21R.json
 node tools/analyze-track.mjs victoria-training-2026-09-27-19L16R.json victoria-training-2026-10-30-21L21R.json --build
 node onedrive-worker/build-assets.mjs

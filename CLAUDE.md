@@ -1,5 +1,17 @@
 # BrixtonVibes — Project Context
 
+## Offline update repair — v42
+
+An actual iPhone still showed v38 after v41 deployed. A new worker/cache alone
+did not reload an already-open old document, and unversioned HTML/assets could
+be served from separate old caches. app-bootstrap.js now installs the matching
+release before loading app.js; HTML/bootstrap/CSS use version URLs; shell
+precache bypasses HTTP cache. Online navigation is network-first; offline still
+uses a complete cached release. update.html?release=42 is the one-time safe
+migration URL for old installations. Never clear IndexedDB/localStorage or
+automatically navigate legacy recording tabs. Test tools/test-update.mjs installs
+the actual5800ff2v38 before migration and checks preservation/recording safety.
+
 ## Current save decision — v41
 
 User explicitly rejects additional signups, payment-card verification, paid or

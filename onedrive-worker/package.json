@@ -1,0 +1,6 @@
+{
+  "name": "brixtonvibes-private-upload",
+  "private": true,
+  "type": "module",
+  "dependencies": { "jose": "6.2.14" }
+}

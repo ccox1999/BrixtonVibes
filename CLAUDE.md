@@ -1,5 +1,46 @@
 # BrixtonVibes — Project Context
 
+## Current save decision — v41
+
+User explicitly rejects additional signups, payment-card verification, paid or
+freemium hosting, and any laptop-on relay. Microsoft account has no Entra tenant;
+do not retry Azure/billing setup. The app now uses NativeRecordingSave and
+OneDriveSync({nativeOnly:true}): Save to OneDrive after Finish opens iOS's
+file/share screen with a prepared real JSON file. OS confirmation is necessary;
+never present a share handoff as a confirmed cloud upload. No auto backend or
+laptop bridge is deployed. See docs/onedrive-button.md. Retain local recordings
+on cancel/failure and hide sharing during recording. Earlier backend notes are
+historical/optional and must not override these explicit user constraints.
+
+## October 30 development — v6 confidence, relative position, protected recordings (sw v40)
+
+Read README.md and docs/algorithm-results.md, docs/track-reference.md and
+docs/onedrive-setup.md before extending the app. October's export is cumulative:
+42 unique real journeys (21L/21R), not 77. The old decision survives untouched;
+37/42 LOJO at Finish and 7/7 new journeys with September calibration. v6 changes
+probability fitting and missing-data behaviour, not historical branch decisions.
+No validated earlier prediction improvement was demonstrated. The promising
+7-trip compass separation remains exploratory and is NOT a deployed override.
+
+TrackPosition matches a relative historical movement profile, not metres.
+Its broad intervals and pause handling are tested, but there is no measured
+junction position or surveyed track geometry. The SVG is explicitly illustrative.
+Do not turn its display split into a classifier or claim geographic accuracy.
+
+Finish journals raw data before labelling, even on Skip. Five-second drafts,
+recovery/download, no six-minute truncation. Live view is hands-free and fits
+iPhone sizes; a single direction/probability replaces the two-row podium.
+The historical classifier must not answer when the main engine lacks evidence.
+
+OneDrive requires external Microsoft/Cloudflare setup. To meet the literal
+no-Microsoft-token-in-browser rule, the Worker keeps tokens encrypted server-side
+and hosts app/API on the same origin for iOS cookie reliability. GitHub Pages
+remains local-only. No secrets, deployment, or real OneDrive delivery were created
+or tested here; the bundle dry-run and mocked security/failure tests pass.
+Never cache /api/ routes or include personal exports in deployment assets.
+
+The earlier notes below describe historical versions, not current behaviour.
+
 ## Compass recording (2026-09-28, sw v38) — data collection only
 
 Every motion sample now also carries `heading` (compass degrees clockwise from magnetic north, 0.01°) and `headingAccuracy` (± degrees, iOS only), or `null` when there is no reading. iOS: `webkitCompassHeading`/`webkitCompassAccuracy` on `deviceorientation` (permission requested in the same tap as motion; motion alone still decides whether recording can start). Other browsers: `360 − alpha` from `deviceorientationabsolute`. **Nothing predicts from it** — the engine (v5.1) and everything else is unchanged. The user will collect trips for a few weeks; the point is to test whether a heading reference can see the turn at the points early (the junction-timing requirement the motion sensors could not meet). Before using it: the raw heading is the PHONE's heading, so it moves when the phone turns in the hand — any feature must be a heading CHANGE over a short window with the phone still, and must be checked against orientation (hard requirement), the tunnel's magnetic noise (traction current, steel; watch `headingAccuracy`), and the usual prospective test on trips it was not tuned on. Trips before v38 have no heading fields. `__live-test.html` now feeds a synthetic compass, labels the trip, and checks the saved recording.

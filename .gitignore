@@ -1,5 +1,6 @@
 # Personal sensor-data exports (real trip recordings, multi-MB) — never publish
 victoria-training-*.json
+victoria-recording-*.json
 
 # Local tool state
 .claude/
@@ -7,3 +8,12 @@ victoria-training-*.json
 # Local test harness (headless-browser verification, not part of the app):
 # the __*-test.html pages and their runner, __serve-tests.mjs
 __*
+
+# Build/deployment and local secrets (the static site is an explicit allowlist)
+node_modules/
+.onedrive-public/
+onedrive-worker/node_modules/
+onedrive-worker/wrangler.jsonc
+onedrive-worker/.dev.vars*
+.wrangler/
+test-results/

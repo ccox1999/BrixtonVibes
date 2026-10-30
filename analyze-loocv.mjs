@@ -21,8 +21,8 @@
      add --trips to print one row per trip
    ============================================================ */
 
-import fs from "node:fs";
 import { calibrate, replayDisplay, shownAt } from "./fork-engine.js";
+import { loadRecordings } from './lib/recordings.mjs';
 
 const LEADS = [30, 24, 20, 16, 12, 10, 8, 6, 4, 2, 0];
 // Targets from the 2026-09-28 goal.
@@ -31,24 +31,24 @@ const T_RANGE = 0.8;         // right at every lead from 10 s to 0 s
 const T_FLIPS = 0.2;         // changes of the shown side after the first firm call
 
 function parseArgs(argv) {
-  const out = { file: null, trainBefore: null, trips: false };
+  const out = { files: [], trainBefore: null, trips: false };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--train-before") out.trainBefore = Date.parse(argv[++i]);
     else if (argv[i] === "--trips") out.trips = true;
-    else out.file = argv[i];
+    else if (argv[i].startsWith('--')) throw new Error(`Unknown option ${argv[i]}`);
+    else out.files.push(argv[i]);
   }
-  if (!out.file) {
-    console.error("usage: node analyze-loocv.mjs <export.json> [--train-before YYYY-MM-DD] [--trips]");
+  if (!out.files.length) {
+    console.error("usage: node analyze-loocv.mjs <export.json> [more exports.json] [--train-before YYYY-MM-DD] [--trips]");
     process.exit(2);
   }
   return out;
 }
 
-function loadTrips(file) {
-  // PowerShell-written copies carry a BOM, which JSON.parse rejects.
-  const d = JSON.parse(fs.readFileSync(file, "utf8").replace(/^﻿/, ""));
-  return (d.examples || [])
-    .filter((e) => (e.label === "left" || e.label === "right") && e.rawMotionData?.length >= 600)
+function loadTrips(files) {
+  const { examples, duplicates } = loadRecordings(files);
+  console.log(`${examples.length} distinct labelled recordings; ${duplicates} duplicate copies excluded.`);
+  return examples
     .map((e) => ({ id: e.id, label: e.label, timestamp: e.timestamp, raw: e.rawMotionData }));
 }
 
@@ -74,6 +74,7 @@ function score(trip, cal) {
 
 function report(title, rows) {
   const n = rows.length;
+  if (!n) throw new Error('No test journeys match the selected date split.');
   const pct = (c) => `${String(Math.round((100 * c) / n)).padStart(3)}%`;
   const right = (L) => rows.filter((r) => r.at[L] && r.at[L].prediction === r.trip.label).length;
   const firmRight = (L) => rows.filter((r) => r.at[L] && r.at[L].phase === "firm" && r.at[L].prediction === r.trip.label).length;
@@ -97,6 +98,14 @@ function report(title, rows) {
   console.log(`  ${mark(flips <= T_FLIPS)}  changes of mind after the first firm call: ${flips.toFixed(2)}/trip (target <= ${T_FLIPS})`);
   console.log(`        a firm call appeared on ${firmLeads.length}/${n} trips` +
     (firmLeads.length ? `, first at a median ${firmLeads[Math.floor(firmLeads.length / 2)].toFixed(0)} s before Stop` : ""));
+  for (const lead of [30,12,0]) {
+    const seen=rows.filter(r=>r.at[lead]);
+    const brier=seen.reduce((sum,r)=>sum+(r.at[lead].pLeft-(r.trip.label==='left'?1:0))**2,0)/seen.length;
+    const high=seen.filter(r=>Math.max(r.at[lead].pLeft,1-r.at[lead].pLeft)>=.8);
+    const wrong=high.filter(r=>r.at[lead].prediction!==r.trip.label).length;
+    console.log(`        ${lead}s before Stop: Brier ${brier.toFixed(3)} on ${seen.length} shown; >=80% calls wrong ${wrong}/${high.length}`);
+  }
+  console.log('        Time-to-Stop checkpoints are evaluation anchors, not measured junction crossing times.');
 }
 
 function printTrips(rows) {
@@ -115,7 +124,7 @@ function printTrips(rows) {
 }
 
 const args = parseArgs(process.argv.slice(2));
-const trips = loadTrips(args.file);
+const trips = loadTrips(args.files);
 const asExamples = (ts) => ts.map((t) => ({ label: t.label, rawMotionData: t.raw }));
 
 let rows, title;

@@ -42,7 +42,17 @@
 
 "use strict";
 
-export const FORK_ENGINE_VERSION = 4;
+/* v6 (30 October 2026): keep the independently tested yaw+jolt decision
+ * and re-armable braking hold. Seven genuinely new October journeys all
+ * passed the frozen September model; no tested weighting improved both
+ * early and final accuracy. Probabilities now use nested journey-held-out
+ * phase calibration, with restrained tentative confidence. Missing sensors
+ * and gaps clear the display until a complete clean window has returned.
+ * The preserved fork-engine-baseline.js and analyze-development.mjs make
+ * this comparison repeatable. Notes below document earlier experiments;
+ * they are not claims of measured junction location or track geometry.
+ */
+export const FORK_ENGINE_VERSION = 6;
 
 // Windows are relative to the arrival instant, in seconds before it.
 export const WIN_FINAL = [26.0, 10.0];
@@ -391,6 +401,13 @@ export const AUTO_ARM_AT = 75.0;   // s; final approach becomes plausible
 const GRAV_TAU = 5.0;              // s, gravity lowpass (yawIntegral)
 const VIB_WIN = 2.0;               // s, vibration RMS window
 const WARMUP = 15.0;               // s before adaptive thresholds are trusted
+const SENSOR_FIELDS = ['ax','ay','az','rotationAlpha','rotationBeta','rotationGamma','gx','gy','gz'];
+function validSensorSample(s) {
+  if(!s || !Number.isFinite(s.time)) return false;
+  for(const field of SENSOR_FIELDS) if(!Number.isFinite(s[field])) return false;
+  const gravity=Math.hypot(s.gx,s.gy,s.gz);
+  return gravity>=6 && gravity<=13;
+}
 
 /* ------------------------------------------------------------
    JUNCTION-ANCHORED EARLY VERDICT — TRIED AND REVERTED, do not re-add
@@ -704,7 +721,91 @@ export function detectJunction(samples, endT) {
  * @returns {object} calibration, or DEFAULT_CAL if there is not enough data
  */
 export function calibrate(examples) {
-  return fitCalibration((examples || []).map(measureTrip).filter(Boolean));
+  const usable = (examples || []).filter(ex => ['left', 'right'].includes(ex.label) && !/^\s*(fake|synthetic)\b/i.test(ex.notes || ''));
+  const measured = usable.map(measureTrip);
+  const trips = measured.filter(Boolean);
+  const cal = fitCalibration(trips);
+  if (cal.liveYaw && cal.liveSkew) {
+    // Estimate confidence from predictions made with each TRAINING journey
+    // omitted. A caller performing outer leave-one-journey-out validation
+    // therefore also omits its test journey from probability fitting.
+    const observations = { firm: [], approach: [], tentative: [] };
+    for (let i = 0; i < usable.length; i++) {
+      if (!measured[i]) continue;
+      const fold = fitCalibration(measured.filter((m,j) => m && i !== j));
+      if (!fold.liveYaw || !fold.liveSkew) continue;
+      const rows = confidenceTrajectory(usable[i].rawMotionData);
+      for (const kind of ['firm', 'approach', 'tentative']) {
+        const group = rows.filter(r => r.kind === kind);
+        for (const r of group) observations[kind].push({
+          z: readingFromComponents(r.yaw, r.skew, fold),
+          y: usable[i].label === 'left' ? 1 : 0, w: 1 / group.length,
+        });
+      }
+    }
+    cal.probability = {
+      firm: fitProbabilitySlope(observations.firm),
+      approach: fitProbabilitySlope(observations.approach),
+      tentative: fitProbabilitySlope(observations.tentative),
+      method: 'journey-held-out phase-specific temperature; equal journey weight; ridge=1; confidence ceilings 55/75/95%',
+    };
+  }
+  return cal;
+}
+
+const confidenceTrajectoryCache = new WeakMap();
+
+// Freeze/release timing depends on vibration alone, so these measurements
+// can be cached independently of the label calibration. They never contain
+// samples from the future of the instant being measured.
+function confidenceTrajectory(raw) {
+  if (confidenceTrajectoryCache.has(raw)) return confidenceTrajectoryCache.get(raw);
+  const unit = { sign: 1, thr: 0, sd: 1 };
+  const engine = new ForkEngine({ liveYaw: unit, liveSkew: unit });
+  const rows = [];
+  let next = raw[0].time + 1000;
+  for (let i=0; i<raw.length; i++) {
+    const s=raw[i], tick=s.time>=next || i===raw.length-1;
+    const v=engine.update(s,raw,tick);
+    if (!tick) continue;
+    while (next<=s.time) next+=1000;
+    if (!v || !['firm','held','provisional'].includes(v.phase)) continue;
+    const t=engine.frozen ? engine.readAt : s.time;
+    const skew=magSkew(raw,t,LIVE_SKEW_TRAIL,0);
+    if (skew===null) continue;
+    rows.push({ kind:probabilityKind(v.phase,engine.movingSec), yaw:yawIntegral(raw,t,LIVE_YAW_TRAIL,0), skew });
+  }
+  confidenceTrajectoryCache.set(raw,rows);
+  return rows;
+}
+
+function fitProbabilitySlope(rows) {
+  const n=Math.round(rows.reduce((s,r)=>s+r.w,0));
+  if (n<8) return { slope:0, journeys:n };
+  let slope=1;
+  // One nonnegative coefficient cannot reverse the selected direction.
+  // Noninformative/anticorrelated tentative scores converge to 0 (50%).
+  for(let iter=0;iter<30;iter++) {
+    let gradient=slope, hessian=1;
+    for(const r of rows) {
+      const p=logistic(slope*r.z,0,1,1);
+      gradient+=r.w*r.z*(p-r.y);
+      hessian+=r.w*r.z*r.z*p*(1-p);
+    }
+    const next=Math.max(0,Math.min(8,slope-gradient/hessian));
+    if(Math.abs(next-slope)<1e-7) { slope=next; break; }
+    slope=next;
+  }
+  return { slope, journeys:n };
+}
+
+function probabilityKind(phase,movingSec) {
+  return phase==='firm'?'firm':phase==='provisional' && movingSec>=WAIT_MOVING_SEC?'approach':'tentative';
+}
+
+function readingFromComponents(yaw,skew,cal) {
+  const y=cal.liveYaw,k=cal.liveSkew;
+  return .5*(y.sign*(yaw-y.thr)/y.sd+k.sign*(skew-k.thr)/k.sd);
 }
 
 /**
@@ -716,7 +817,12 @@ function measureTrip(ex) {
   const raw = ex.rawMotionData;
   if (!raw || raw.length < 600) return null;
   const end = raw[raw.length - 1].time;           // user stops at arrival
+  if(!Number.isFinite(end)) return null;
   const cut = end - LIVE_CAL_LEAD * 1000;
+  // Broken sensor windows are not labelled examples of a zero turn.
+  const window=raw.filter(s=>s.time>=cut-LIVE_YAW_TRAIL*1000 && s.time<=cut);
+  if(window.length<64 || window.some(s=>!validSensorSample(s))) return null;
+  for(let i=1;i<window.length;i++) if(window[i].time-window[i-1].time>2000) return null;
   return {
     left: ex.label === "left",
     yawFinal: yawIntegral(raw, end, WIN_FINAL[0], WIN_FINAL[1]),
@@ -809,13 +915,16 @@ export class ForkEngine {
     // v5.1 — see that note.
     this.movingSec = 0;     // seconds so far with vibration >= WAIT_MOVING_FRAC x cruise
     this.maybeWait = false; // the current freeze came too early to be the platform
+    this.lastSampleTime = null;
+    this.invalidUntil = -Infinity;
+    this.qualityReason = null;
   }
 
   /**
    * @param {object} s   one motion sample
    * @param {Array} all  the full sample buffer (for window integrals)
    * @returns {object} {phase, pLeft, prediction, elapsed, armed, frozen}
-   *   phase: "waiting"     nothing new to show (the display keeps the last)
+   *   phase: "waiting"     no usable reading; the display clears
    *          "provisional" the rolling reading; not a firm call
    *          "firm"        the call frozen as braking began
    *          "held"        frozen too, but too early in the journey to be
@@ -825,6 +934,20 @@ export class ForkEngine {
    *          "early"       v1 yaw fallback before there is a calibration
    */
   update(s, all, computeVerdict = true) {
+    const valid = validSensorSample(s);
+    const gap = valid && this.lastSampleTime!==null && s.time-this.lastSampleTime>2000;
+    if (!valid || gap) {
+      this.qualityReason = gap ? 'sensor-gap' : 'missing-sensors';
+      if (Number.isFinite(s?.time)) { this.invalidUntil=s.time+LIVE_YAW_TRAIL*1000; this.lastSampleTime=s.time; }
+      this.vib=[];
+      this.frozen=false; this.frozenZ=null; this.lowSince=null; this.highSince=null; this.readAt=null;
+      return computeVerdict ? {phase:'cleared',pLeft:.5,pRight:.5,prediction:null,score:0,
+        dataQuality:this.qualityReason,probabilityReliable:false,confidenceKind:'unavailable',armed:this.armed,frozen:false,movingSec:this.movingSec} : null;
+    }
+    // Old exports sometimes contain equal/out-of-order millisecond stamps.
+    // Do not integrate or advance the state machine twice at one instant.
+    if (this.lastSampleTime!==null && s.time<=this.lastSampleTime) return null;
+    this.lastSampleTime=s.time;
     const t = s.time;
     if (this.t0 === null) this.t0 = t;
     const elapsed = (t - this.t0) / 1000;
@@ -897,6 +1020,10 @@ export class ForkEngine {
     // a backlog pass computeVerdict=false for all but the last sample.
     if (!computeVerdict) return null;
 
+    if(t<this.invalidUntil) return {phase:'cleared',pLeft:.5,pRight:.5,prediction:null,score:0,
+      dataQuality:'warming-up',probabilityReliable:false,confidenceKind:'unavailable',armed:this.armed,frozen:this.frozen,movingSec:this.movingSec};
+    this.qualityReason=null;
+
     let phase = "waiting", score = 0, p = 0.5;
     const c = this.cal;
     if (this.armed && c.liveYaw && c.liveSkew) {
@@ -916,28 +1043,38 @@ export class ForkEngine {
           if (z !== null) { phase = "provisional"; score = z; }
         }
       }
-      // The average of two z-scores, used directly as log-odds. No cap:
-      // measured, it is if anything under-confident (see the v4 note).
-      if (phase === "firm" || phase === "held" || phase === "provisional") p = logistic(score, 0, 1, 1);
+      if (phase === "firm" || phase === "held" || phase === "provisional") {
+        const kind=probabilityKind(phase,this.movingSec);
+        const slope=c.probability?.[kind]?.slope ?? 0;
+        // Position is not observed absolutely. Even a large turn score
+        // before a braking hold can be the earlier common route curve.
+        // Keep tentative calls visibly tentative, even in small-sample
+        // calibration fits that happen to separate their training data.
+        const ceiling=kind==='firm'?.95:kind==='approach'?.75:.55;
+        p=Math.max(1-ceiling,Math.min(ceiling,logistic(score*slope,0,1,1)));
+      }
     } else if (this.armed) {
       // No live calibration yet (fewer than 3 labelled trips per side).
       // Fall back to the v1 yaw reading so a fresh install still shows
       // something, with its known flicker.
       phase = "early";
       score = yawIntegral(all, t, WIN_EARLY[0] - WIN_EARLY[1], 0);
-      p = logistic(score, c.thrEarly, c.scaleEarly, c.sign);
-      p = Math.min(Math.max(p, 0.15), 0.85);   // provisional, cap confidence
+      score = c.sign*(score-c.thrEarly)/c.scaleEarly;
+      p = .5; // no calibrated probability exists on a fresh installation
     }
     return {
       phase,
       score,
       pLeft: p,
       pRight: 1 - p,
-      prediction: p > 0.5 ? "left" : "right",
+      prediction: score > 0 ? "left" : "right",
       elapsed,
       armed: this.armed,
       frozen: this.frozen,
       movingSec: this.movingSec,
+      dataQuality:'good',
+      probabilityReliable:phase==='firm' && (c.probability?.firm?.journeys||0)>=8,
+      confidenceKind:phase==='firm' && c.probability ? 'calibrated-firm' : 'tentative',
     };
   }
 
@@ -974,8 +1111,9 @@ export function liveReadingAt(samples, t, cal) {
  * Replay a finished recording through a fresh ForkEngine exactly as the
  * app runs it live — every sample through the state machine, one verdict
  * per second of sample time — and return what the SCREEN showed each
- * second. The display rules are makeLivePrediction()'s: a "waiting"
- * verdict leaves the last reading on screen, a "cleared" one blanks it.
+ * second. The display rules are makeLivePrediction()'s: both "waiting"
+ * and "cleared" blank the reading. Missing evidence never preserves a
+ * stale apparently current prediction.
  *
  * Passing the whole recording is causal: every window reads only samples
  * at or before the instant being evaluated.
@@ -996,10 +1134,10 @@ export function replayDisplay(samples, cal) {
     const s = samples[i];
     const tick = s.time >= nextTick || i === last;
     const v = engine.update(s, samples, tick);
-    if (!tick) continue;
+    if (!tick || !v) continue;
     while (nextTick <= s.time) nextTick += 1000;
-    if (v.phase === "cleared") shown = null;
-    else if (v.phase !== "waiting") shown = { prediction: v.prediction, pLeft: v.pLeft, phase: v.phase };
+    if (v.phase === "cleared" || v.phase === "waiting") shown = null;
+    else shown = { prediction: v.prediction, pLeft: v.pLeft, phase: v.phase, score:v.score, confidenceKind:v.confidenceKind, dataQuality:v.dataQuality };
     out.push({ t: s.time, shown });
   }
   return out;
@@ -1032,6 +1170,7 @@ export function estimateAccuracy(examples, minPerSide = 5) {
   const trips = [], raws = [], labels = [];
   for (const ex of examples || []) {
     if (ex.label !== "left" && ex.label !== "right") continue;
+    if (/^\s*(fake|synthetic)\b/i.test(ex.notes || '')) continue;
     const m = measureTrip(ex);
     if (!m) continue;
     trips.push(m); raws.push(ex.rawMotionData); labels.push(ex.label);

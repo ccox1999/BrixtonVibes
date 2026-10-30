@@ -32,14 +32,19 @@
 let mlModules = null;
 async function loadMLModules() {
   if (mlModules) return mlModules;
-  const [features, classifier, trainingSet, rawStore, forkEngine] = await Promise.all([
+  const [features, classifier, trainingSet, rawStore, forkEngine, position, reference, trackView, cloud, nativeSave] = await Promise.all([
     import("./features.js"),
     import("./classifier.js"),
     import("./training-set.js"),
     import("./raw-store.js"),
     import("./fork-engine.js"),
+    import("./track-position.js"),
+    import("./track-reference.js"),
+    import("./track-view.js"),
+    import("./onedrive-sync.js"),
+    import("./native-save.js"),
   ]);
-  mlModules = { features, classifier, trainingSet, rawStore, forkEngine };
+  mlModules = { features, classifier, trainingSet, rawStore, forkEngine, position, reference, trackView, cloud, nativeSave };
   return mlModules;
 }
 
@@ -111,9 +116,19 @@ async function loadMLModules() {
       gyroCanvas: requireElement("gyroChart"),
       trainingStatus: requireElement("trainingStatus"),
       liveForcastCard: requireElement("liveForcastCard"),
-      forecastLeft: requireElement("forecastLeft"),
-      forecastRight: requireElement("forecastRight"),
+      forecastDirection: requireElement("forecastDirection"),
+      forecastProbability: requireElement("forecastProbability"),
       forecastNote: requireElement("forecastNote"),
+      trackView: requireElement("trackView"),
+      trackProgress: requireElement("trackProgress"),
+      trackUncertainty: requireElement("trackUncertainty"),
+      trackMotion: requireElement("trackMotion"),
+      saveStatus: requireElement("saveStatus"),
+      cloudStatus: requireElement("cloudStatus"),
+      sensorWarning: requireElement("sensorWarning"),
+      recordLabel: requireElement("recordLabel"),
+      saveOneDriveBtn: requireElement('saveOneDriveBtn'),
+      saveOneDriveHelp: requireElement('saveOneDriveHelp'),
     };
   } catch (err) {
     console.error("[MotionLab] Startup failed:", err);
@@ -171,6 +186,21 @@ async function loadMLModules() {
     forkFedUpTo: 0,           // samples already pushed through forkEngine
     lastDisplayedLeader: null,// which direction was on top last time (for podium animation)
     selectedModelName: null,  // "knn" | "logreg" — chosen by cross-validation
+    sync: null,
+    recordingId: null,
+    journalTimer: null,
+    journalPending: Promise.resolve(),
+    tracker: null,
+    trackReference: null,
+    trackView: null,
+    position: null,
+    wakeLock: null,
+    lastSampleReceivedAt: null,
+    predictionPending: false,
+    finishing: false,
+    nativeSave: null,
+    nativeRecordId: null,
+    nativePreparation: 0,
   };
 
   // ---------- Small helpers ------------------------------------------------
@@ -494,29 +524,16 @@ async function loadMLModules() {
     // Sort by timestamp, newest first
     const sorted = [...state.trainSet.examples].sort((a, b) => b.timestamp - a.timestamp);
 
-    ui.recordingsList.innerHTML = sorted.map((ex, idx) => {
-      const date = new Date(ex.timestamp);
-      const timeStr = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-      const dateStr = date.toLocaleDateString([], { month: "short", day: "numeric" });
-      const durationStr = ex.duration ? `${ex.duration}s` : "—";
-      const labelClass = ex.label === "left" ? "recording-label-left" : "recording-label-right";
-      const labelEmoji = ex.label === "left" ? "←" : "→";
-
-      return `
-        <div class="recording-item">
-          <div class="recording-info">
-            <div class="recording-label ${labelClass}">
-              ${labelEmoji} ${ex.label.toUpperCase()}
-            </div>
-            <div class="recording-timestamp">${dateStr} at ${timeStr}</div>
-          </div>
-          <div class="recording-duration">${durationStr}</div>
-          <button type="button" class="recording-delete" data-id="${ex.id}" title="Delete this recording">
-            ✕
-          </button>
-        </div>
-      `;
-    }).join("");
+    ui.recordingsList.replaceChildren();
+    for (const ex of sorted) {
+      const item=document.createElement('div'); item.className='recording-item';
+      const label=document.createElement('strong'); label.textContent=ex.label==='left'?'← LEFT':'RIGHT →';
+      const meta=document.createElement('p');
+      meta.textContent=`${new Date(ex.timestamp).toLocaleString()} · ${ex.duration || '—'} s`;
+      const button=document.createElement('button'); button.className='recording-delete btn';
+      button.dataset.id=ex.id; button.title='Delete labelled training journey'; button.textContent='Delete';
+      item.append(label,meta,button);ui.recordingsList.appendChild(item);
+    }
 
     // Wire up delete buttons
     ui.recordingsList.querySelectorAll(".recording-delete").forEach(btn => {
@@ -528,6 +545,7 @@ async function loadMLModules() {
           state.trainSet.remove(id);
           state.trainSet.save().then(() => {
             updateTrainingStatus();
+            refreshForkCalibration();
           });
         }
       });
@@ -541,9 +559,9 @@ async function loadMLModules() {
   async function loadLabelledTrips() {
     const trips = [];
     for (const ex of state.trainSet?.examples || []) {
-      if (!ex || !ex.label) continue;
+      if (!ex || !ex.label || /fake|synthetic/i.test(ex.notes || '')) continue;
       const raw = await state.trainSet.getRawMotionData(ex.id);
-      if (raw && raw.length) trips.push({ label: ex.label, rawMotionData: raw });
+      if (raw && raw.length) trips.push({ label: ex.label, rawMotionData: raw, notes: ex.notes });
     }
     return trips;
   }
@@ -559,12 +577,15 @@ async function loadMLModules() {
    * every raw recording out of IndexedDB. Falls back to shipped defaults.
    */
   async function refreshForkCalibration(trips) {
+    if (state.recording) return;
+    state.forkCal = null;
     try {
       if (!state.trainSet || state.trainSet.count() < 6) return;
       const ml = await loadMLModules();
       const examples = trips || (await loadLabelledTrips());
       if (examples.length < 6) return;
       const cal = ml.forkEngine.calibrate(examples);
+      if (!state.recording) state.trackReference = ml.position.buildTrackReference(examples) || state.trackReference;
       // Only adopt a calibration that actually separates the classes; a
       // degenerate one would be worse than the shipped defaults.
       if (cal && cal.separation > 0.5) {
@@ -583,9 +604,20 @@ async function loadMLModules() {
    * (throttled by renderFrame).
    */
   async function makeLivePrediction() {
-    if (!state.recording) return;       // Stop freezes the display
+    if (!state.recording || state.predictionPending) return; // Finish freezes the display
     if (state.data.length < 30) return; // need at least 0.5s of data
+    if (performance.now() - state.lastSampleReceivedAt > SENSOR_WATCHDOG_MS) {
+      state.lastLivePrediction = null;
+      clearForecastPodium();
+      setForecastStyle('provisional');
+      ui.forecastNote.textContent = 'Sensor feed interrupted — position held';
+      ui.trackMotion.textContent = 'Sensors paused';
+      ui.trackUncertainty.textContent = 'Position held · feed interrupted';
+      return;
+    }
+    if (state.forkFedUpTo >= state.data.length) return;
 
+    state.predictionPending = true;
     try {
       const ml = await loadMLModules();
 
@@ -606,6 +638,7 @@ async function loadMLModules() {
       const last = state.data.length - 1;
       for (let i = state.forkFedUpTo; i < state.data.length; i++) {
         const out = state.forkEngine.update(state.data[i], state.data, i === last);
+        if (state.tracker) state.position = state.tracker.update(state.data[i]);
         if (out) forkOut = out;
       }
       state.forkFedUpTo = state.data.length;
@@ -613,6 +646,10 @@ async function loadMLModules() {
       // Stop was tapped while this update was in flight. The screen is
       // frozen on what it showed at the tap — never repaint it afterwards.
       if (!state.recording) return;
+      renderPosition();
+      if (forkOut?.dataQuality && forkOut.dataQuality !== 'good') {
+        ui.sensorWarning.textContent = forkOut.dataQuality === 'warming-up' ? '' : 'Sensor gap or missing readings — waiting for clean evidence.';
+      } else if (forkOut?.dataQuality === 'good') ui.sensorWarning.textContent = '';
 
       if (forkOut && forkOut.phase === "cleared") {
         // The train moved off after a wait outside Brixton. The call made
@@ -620,8 +657,11 @@ async function loadMLModules() {
         // until the reading has refilled with motion (fork-engine.js v5).
         state.lastLivePrediction = null;
         clearForecastPodium();
+        renderPosition();
         setForecastStyle("provisional");
-        ui.forecastNote.textContent = "moving again — re-reading the approach…";
+        ui.forecastNote.textContent = forkOut.dataQuality && forkOut.dataQuality !== 'good'
+          ? 'Sensor evidence unavailable — rebuilding a clean reading'
+          : 'Moving again — re-reading the approach…';
         return;
       }
       if (forkOut && forkOut.phase !== "waiting") {
@@ -633,61 +673,37 @@ async function loadMLModules() {
         // the call (fork-engine.js v5.1).
         const firm = forkOut.phase === "firm";
         state.lastLivePrediction = {
-          pLeft: forkOut.pLeft, pRight: forkOut.pRight, source: "fork-engine", firm,
+          pLeft: forkOut.pLeft, pRight: forkOut.pRight, prediction: forkOut.prediction, source: "fork-engine", firm,
         };
-        updateForecastPodium(forkOut.pLeft * 100, forkOut.pRight * 100);
+        updateForecastPodium(forkOut.pLeft * 100, forkOut.pRight * 100, forkOut.prediction);
+        renderPosition();
         setForecastStyle(firm ? "firm" : "provisional");
         ui.forecastNote.textContent = firm
-          ? "braking — this is the call"
+          ? forkOut.probabilityReliable ? "Braking — held estimate from past journeys" : "Braking — limited calibration data"
           : forkOut.phase === "held"
             ? "slowing — could be a signal stop, not the platform"
-            : "provisional — firms up as the train brakes";
+            : "Tentative — little reliable branch evidence yet";
         return;
       }
       // Before the route prior arms (first ~75 s) there is no fork evidence
       // yet; show the waiting state rather than a meaningless number.
       if (forkOut && forkOut.phase === "waiting") {
+        state.lastLivePrediction = null;
+        clearForecastPodium();
+        renderPosition();
         ui.forecastNote.textContent = forkOut.armed
           ? "approach — locating the junction…"
           : "waiting for the approach…";
         return;
       }
 
-      if (!state.trainSet || state.trainSet.count() < 5) return;
-
-      // Extract features from the most fork-like window found in the trip SO
-      // FAR — the same function (and therefore the same feature distribution)
-      // used to build the saved training examples. Once the real fork has
-      // happened its sustained yaw outscores everything else and the forecast
-      // locks onto it; before that it rides whatever window looks most turn-like
-      // and is held back by the 60% confidence gate.
-      const features = ml.features.extractForkFeatures(state.data, 60);
-
-      // Build the classifier once per recording; rebuild only if the
-      // training set has changed since (labelling happens between trips).
-      if (!state.classifier || state.classifierBuiltFor !== state.trainSet.count()) {
-        state.classifier = await buildClassifier();
-        state.classifierBuiltFor = state.trainSet.count();
-      }
-
-      // Continuous (distance-weighted) probability — smooth, not quantised to
-      // k discrete votes, so the live percentage actually moves second to
-      // second instead of jumping in 20-point steps.
-      const proba = state.classifier.predictProbability(features);
-      state.lastLivePrediction = proba;
-
-      const leftPct = proba.pLeft * 100;
-      const rightPct = proba.pRight * 100;
-
-      updateForecastPodium(leftPct, rightPct);
-
-      ui.forecastNote.textContent =
-        state.selectedModelName === "logreg"
-          ? "logistic-regression estimate"
-          : `based on ${proba.neighbors.length} nearest trips`;
+      // Insufficient route evidence stays undecided; the retired classifier must
+      // not turn missing sensor data into an apparently confident fallback.
+      clearForecastPodium();
+      ui.forecastNote.textContent = 'No usable route evidence yet';
     } catch (err) {
       console.warn("[ML] Live prediction failed:", err);
-    }
+    } finally { state.predictionPending = false; }
   }
 
   /**
@@ -695,31 +711,19 @@ async function loadMLModules() {
    * the higher percentage takes the top rank, and the rank-top / rank-bottom
    * classes animate the two rows sliding past each other on a lead change.
    */
-  function updateForecastPodium(leftPct, rightPct) {
-    ui.forecastLeft.querySelector(".forecast-percentage").textContent =
-      `${leftPct.toFixed(1)}%`;
-    ui.forecastRight.querySelector(".forecast-percentage").textContent =
-      `${rightPct.toFixed(1)}%`;
-
-    const leader = leftPct >= rightPct ? "left" : "right";
-    const leftLeads = leader === "left";
-
-    ui.forecastLeft.classList.toggle("rank-top", leftLeads);
-    ui.forecastLeft.classList.toggle("rank-bottom", !leftLeads);
-    ui.forecastRight.classList.toggle("rank-top", !leftLeads);
-    ui.forecastRight.classList.toggle("rank-bottom", leftLeads);
-
-    // Haptic tick on a lead change to make the podium swap feel physical.
-    if (state.lastDisplayedLeader && state.lastDisplayedLeader !== leader) {
-      hapticTick(12);
-    }
+  function updateForecastPodium(leftPct, rightPct, prediction) {
+    const leader = prediction || (leftPct >= rightPct ? 'left' : 'right');
+    const probability = leader === 'left' ? leftPct : rightPct;
+    ui.forecastDirection.textContent = leader === 'left' ? 'Left platform' : 'Right platform';
+    // Five-point steps reflect the small calibration sample; no decimal certainty.
+    ui.forecastProbability.textContent = `${Math.round(probability / 5) * 5}%`;
     state.lastDisplayedLeader = leader;
   }
 
-  /** Blank both podium rows (a withdrawn call); the rows keep their order. */
   function clearForecastPodium() {
-    ui.forecastLeft.querySelector(".forecast-percentage").textContent = "—";
-    ui.forecastRight.querySelector(".forecast-percentage").textContent = "—";
+    ui.forecastDirection.textContent = 'Awaiting evidence';
+    ui.forecastProbability.textContent = '';
+    state.lastDisplayedLeader = null;
   }
 
   /**
@@ -813,16 +817,16 @@ async function loadMLModules() {
         rotationAlpha: s.rotationAlpha,
         rotationBeta: s.rotationBeta,
         rotationGamma: s.rotationGamma,
-        gx: s.gx ?? 0,
-        gy: s.gy ?? 0,
-        gz: s.gz ?? 0,
+        gx: s.gx ?? null,
+        gy: s.gy ?? null,
+        gz: s.gz ?? null,
         // Compass: null, never 0 — 0 would mean "due north".
         heading: s.heading ?? null,
         headingAccuracy: s.headingAccuracy ?? null,
       }));
 
       state.trainSet.add(features, label, {
-        recordingId: ml.trainingSet.generateRecordingId(),
+        recordingId: state.recordingId || ml.trainingSet.generateRecordingId(),
         featureVersion: ml.features.FEATURE_VERSION,
         timestamp: Date.now(),
         sampleCount: state.data.length,
@@ -869,7 +873,7 @@ async function loadMLModules() {
         console.warn("[fork] accuracy estimate skipped:", err);
       }
 
-      alert(
+      console.info(
         `✓ Saved to training set!\n\nTotal: ${stats.totalExamples} examples\nLeft: ${stats.leftCount} | Right: ${stats.rightCount}${accuracyLine}\n\nBackup saved automatically — download anytime via "⬇️ Backup Data".`
       );
 
@@ -879,6 +883,173 @@ async function loadMLModules() {
       alert(`Failed to save: ${err.message}`);
     }
   }
+
+  // ---------- Local-first preservation and independent position UI --------
+
+  function showSaveError(error) {
+    ui.saveStatus.textContent = 'Local save failed — keep this page open and save to OneDrive or retry.';
+    ui.saveStatus.style.color = '#ffc28a';
+    ui.sensorWarning.textContent = String(error?.message || error);
+    if (state.recording) {
+      ui.saveStatus.textContent = 'Recovery save failed · Finish to retry or download safely';
+      ui.sensorWarning.textContent = '';
+      return;
+    }
+    const old = document.getElementById('emergencyDownload');
+    if (!old) {
+      const button = document.createElement('button');
+      button.id = 'emergencyDownload'; button.className = 'btn';
+      button.textContent = 'Save unsaved recording to OneDrive';
+      const payload=recordingPayload(true);
+      const portable=mlModules?.cloud.recordingExport(payload) || {version:3,examples:[{...payload,id:payload.recordingId,features:{},hasRawData:true}]};
+      state.nativeSave?.prepare(new Blob([JSON.stringify(portable)],{type:'application/json'}),`victoria-recording-${state.recordingId}.json`);
+      button.disabled=!state.nativeSave?.supported();
+      button.addEventListener('click', () => state.nativeSave?.share().catch(showCloudError));
+      ui.saveStatus.after(button);
+    }
+    if (!document.getElementById('retryLocalSave')) {
+      const retry=document.createElement('button'); retry.id='retryLocalSave'; retry.className='btn';
+      retry.textContent='Retry local save';
+      retry.addEventListener('click',()=>protectRecording(!state.recording));
+      ui.saveStatus.after(retry);
+    }
+  }
+
+  function showCloudError(error) {
+    ui.cloudStatus.textContent = `OneDrive: ${error?.message || error}. Local recordings retained.`;
+  }
+
+  function recordingPayload(complete) {
+    return { format: 'brixtonvibes-recording-v1', recordingId: state.recordingId,
+      complete, recordedAt: Math.round(state.epochBase + state.startTime),
+      timestamp: Math.round(state.epochBase + state.startTime),
+      sampleCount: state.data.length,
+      duration: state.data.length ? (state.data.at(-1).time - state.startTime)/1000 : 0,
+      rawMotionData: state.data.map(s => ({...s, time:Math.round(state.epochBase + s.time)})),
+      livePredictionAtFinish: complete ? state.lastLivePrediction : null,
+      positionAtFinish: complete ? state.position : null };
+  }
+
+  function protectRecording(complete) {
+    if (!state.data.length) return Promise.resolve(false);
+    const payload = recordingPayload(complete);
+    const work = state.journalPending.catch(() => {}).then(async () => {
+      if (!state.sync) throw new Error('Local recording store unavailable');
+      await state.sync.saveRecording(payload);
+      state.memoryUnsaved = false;
+      document.getElementById('emergencyDownload')?.remove();
+      document.getElementById('retryLocalSave')?.remove();
+      ui.saveStatus.style.color = '';
+      if (complete) ui.saveStatus.textContent = 'Saved on this device · preparing OneDrive save';
+      if (complete) await prepareNativeRecording(payload.recordingId).catch(showCloudError);
+      return true;
+    }).catch(error => { state.memoryUnsaved = true; showSaveError(error); return false; });
+    state.journalPending = work;
+    return work;
+  }
+
+  function downloadBlob(blob, filename) {
+    const url=URL.createObjectURL(blob), a=document.createElement('a');
+    a.href=url; a.download=filename; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  async function prepareNativeRecording(id) {
+    if (!state.sync || !state.nativeSave || state.recording) return;
+    const request=++state.nativePreparation;
+    ui.saveOneDriveBtn.disabled=true;
+    const file=await state.sync.downloadRecording(id);
+    if (request !== state.nativePreparation || state.recording) return;
+    state.nativeRecordId=id;
+    state.nativeSave.prepare(file.blob,file.filename);
+    ui.saveOneDriveBtn.classList.remove('hidden');
+    ui.saveOneDriveHelp.classList.remove('hidden');
+    ui.saveOneDriveBtn.disabled=state.finishing || !state.nativeSave.supported();
+    ui.saveOneDriveHelp.textContent=state.nativeSave.supported()
+      ? 'Choose OneDrive in the system sheet, select your folder, then Save.'
+      : 'File sharing needs iPhone Safari and the OneDrive app / Files provider.';
+  }
+
+  ui.saveOneDriveBtn.addEventListener('click',()=>{
+    // File was prepared after Finish/reload. Sharing starts in THIS user tap.
+    state.nativeSave?.share().catch(error=>{
+      ui.saveStatus.textContent=`Could not open OneDrive save: ${error.message}. Recording retained.`;
+      ui.saveOneDriveBtn.disabled=false;
+    });
+  });
+
+  async function renderLocalRecordings() {
+    if (!state.sync || state.recording) return;
+    const container=document.getElementById('localRecordings');
+    const rows=await state.sync.listRecordings();
+    container.replaceChildren();
+    for (const row of rows.slice(0,30)) {
+      const div=document.createElement('div'); div.className='local-recording';
+      const text=document.createElement('span');
+      text.textContent=`${new Date(row.createdAt).toLocaleDateString()} · ${row.complete ? 'Saved trip' : 'Recovered unfinished trip'}`;
+      const button=document.createElement('button'); button.className='btn'; button.textContent='Select for OneDrive';
+      button.addEventListener('click',async()=>{try{await prepareNativeRecording(row.id);ui.saveOneDriveBtn.scrollIntoView({behavior:'smooth',block:'center'});ui.saveOneDriveBtn.focus();}catch(error){showCloudError(error);}});
+      div.append(text,button); container.appendChild(div);
+      if (!row.complete) {
+        const finish=document.createElement('button'); finish.className='btn'; finish.textContent='Keep trip';
+        finish.addEventListener('click',async()=>{try{await state.sync.updateRecording(row.id,{complete:true,recovered:true});await prepareNativeRecording(row.id);await renderLocalRecordings();}catch(error){showCloudError(error);}});
+        div.appendChild(finish);
+      }
+    }
+  }
+
+  function renderPosition() {
+    state.trackView?.render(state.position,state.lastLivePrediction);
+    const p=state.position;
+    if (!Number.isFinite(p?.progress)) {
+      ui.trackProgress.textContent='Learning the movement';
+      ui.trackUncertainty.textContent='No position fix yet';
+    } else {
+      ui.trackProgress.textContent=`Relative progress ≈ ${Math.round(p.progress*20)*5}%`;
+      ui.trackUncertainty.textContent=`Range ${Math.floor(p.lower*20)*5}–${Math.ceil(p.upper*20)*5}%`;
+    }
+    ui.trackMotion.textContent=p?.quality==='limited-sensors'?'Sensors limited':p?.moving?'Moving':state.recording?'Stopped / slow':'Ready';
+  }
+
+  async function requestWakeLock() {
+    try { if (navigator.wakeLock && !document.hidden) state.wakeLock = await navigator.wakeLock.request('screen'); }
+    catch { /* Optional iOS capability; visibility warning remains truthful. */ }
+  }
+
+  async function initJourneyTools() {
+    try {
+      const ml=await loadMLModules();
+      state.trackReference=ml.reference.TRACK_REFERENCE;
+      state.trackView=new ml.trackView.TrackView(ui.trackView);
+      state.nativeSave=new ml.nativeSave.NativeRecordingSave({onStatus:status=>{
+        if (status.state==='ready') {
+          ui.saveStatus.textContent=state.memoryUnsaved?'Device save failed · save to OneDrive or retry local save':'Saved on this phone · ready for OneDrive';
+        } else if (status.state==='sharing') {
+          ui.saveOneDriveBtn.disabled=true;
+          ui.saveStatus.textContent='Choose OneDrive and confirm the save in the system sheet';
+        } else if (status.state==='handed-off') {
+          ui.saveOneDriveBtn.disabled=false;
+          ui.saveStatus.textContent=state.memoryUnsaved?'Handed to the system · device save still needs retry. Check OneDrive.':'Handed to the system · check OneDrive for upload status. Local copy retained.';
+        } else if (status.state==='cancelled') {
+          ui.saveOneDriveBtn.disabled=false;
+          ui.saveStatus.textContent='Save cancelled · recording is still on this phone. Tap to try again.';
+        }
+      }});
+      state.sync=new ml.cloud.OneDriveSync({nativeOnly:true,onStatus:status=>{
+        ui.cloudStatus.textContent=status.configured?status.message:'Uses your existing OneDrive on this iPhone. No extra signup, card, hosting or laptop.';
+        document.getElementById('cloudAccountControls').classList.toggle('hidden',!status.configured);
+        if (!state.recording && status.configured && status.message) ui.saveStatus.textContent=status.message;
+        document.getElementById('connectOneDriveBtn').disabled=!status.configured || state.recording;
+      }});
+      await state.sync.init();
+      await renderLocalRecordings();
+      const latest=(await state.sync.listRecordings()).find(row=>row.complete);
+      if (latest) await prepareNativeRecording(latest.id);
+    } catch(error) { showSaveError(error); }
+  }
+
+  document.getElementById('connectOneDriveBtn').addEventListener('click',()=>state.sync?.connect().catch(showCloudError));
+  document.getElementById('retryUploadBtn').addEventListener('click',()=>state.sync?.retry({force:true}).catch(showCloudError));
 
   // ---------- Render loop --------------------------------------------------
 
@@ -1242,21 +1413,21 @@ async function loadMLModules() {
 
     state.data.push({
       time: t,
-      ax: acc?.x ?? 0,
-      ay: acc?.y ?? 0,
-      az: acc?.z ?? 0,
-      rotationAlpha: rot?.alpha ?? 0,
-      rotationBeta: rot?.beta ?? 0,
-      rotationGamma: rot?.gamma ?? 0,
+      ax: acc?.x ?? null,
+      ay: acc?.y ?? null,
+      az: acc?.z ?? null,
+      rotationAlpha: rot?.alpha ?? null,
+      rotationBeta: rot?.beta ?? null,
+      rotationGamma: rot?.gamma ?? null,
       // Gravity estimate in device coordinates: (accel incl. gravity) −
       // (linear accel) is the OS's own sensor-fusion gravity vector. It
       // tells the feature extractor which way is DOWN, which makes the
       // turn-direction features orientation-invariant. The sign convention
       // differs between platforms, but it's consistent per device — which
       // is all the classifier needs.
-      gx: (aig?.x ?? 0) - (acc?.x ?? 0),
-      gy: (aig?.y ?? 0) - (acc?.y ?? 0),
-      gz: (aig?.z ?? 0) - (acc?.z ?? 0),
+      gx: Number.isFinite(aig?.x) && Number.isFinite(acc?.x) ? aig.x - acc.x : null,
+      gy: Number.isFinite(aig?.y) && Number.isFinite(acc?.y) ? aig.y - acc.y : null,
+      gz: Number.isFinite(aig?.z) && Number.isFinite(acc?.z) ? aig.z - acc.z : null,
       // Latest compass reading (see handleOrientation), rounded: compass
       // accuracy is whole degrees at best, so more digits only bloat backups.
       heading: state.heading === null ? null : Math.round(state.heading * 100) / 100,
@@ -1269,13 +1440,9 @@ async function loadMLModules() {
       state.watchdogId = null;
     }
 
-    // Amortised trim: the original spliced one element per event once full,
-    // shifting the entire 20k array ~60 times a second.
-    if (state.data.length > MAX_BUFFER_POINTS + TRIM_CHUNK) {
-      state.data.splice(0, state.data.length - MAX_BUFFER_POINTS);
-      state.dataTrimmed = true;
-    }
-
+    // Preserve the WHOLE recording, including long signal waits. The previous
+    // 20k ring buffer silently discarded the start after about six minutes.
+    state.lastSampleReceivedAt = performance.now();
     scheduleRender(); // idempotent — keeps the loop alive if it ever stopped
   }
 
@@ -1360,6 +1527,25 @@ async function loadMLModules() {
   // ---------- Recording ----------------------------------------------------
 
   function startRecording() {
+    if (state.finishing) return;
+    if (state.memoryUnsaved) { showSaveError(new Error('Download or retry saving the current recording before starting another.')); return; }
+    state.recordingId = crypto.randomUUID();
+    state.position = null;
+    state.trackView?.render(null,null);
+    state.tracker = mlModules ? new mlModules.position.TrackPosition(state.trackReference || mlModules.reference.TRACK_REFERENCE) : null;
+    state.lastSampleReceivedAt = null;
+    state.sync?.setRecording(true);
+    state.nativeSave?.setRecording(true);
+    state.nativePreparation++;
+    ui.saveOneDriveBtn.disabled=true;
+    ui.saveOneDriveBtn.classList.add('hidden');
+    ui.saveOneDriveHelp.classList.add('hidden');
+    clearInterval(state.journalTimer);
+    state.journalTimer = setInterval(() => protectRecording(false), 5000);
+    requestWakeLock();
+    ui.recordLabel.textContent = 'Finish recording';
+    ui.saveStatus.textContent = 'Recording · local recovery copy every 5 seconds';
+    ui.sensorWarning.textContent = '';
     state.data = [];
     state.dataTrimmed = false;
     state.startTime = performance.now();
@@ -1409,21 +1595,15 @@ async function loadMLModules() {
     document.body.classList.add("recording");   // route panning through JS (CSS)
     // Take over scrolling on the main thread so the page still scrolls but the
     // sensors never stall (see enableRecordingScroll).
-    enableRecordingScroll();
+    // Live controls fit on one screen. No scroll, menus, haptics, or handling.
+    document.getElementById("toolsGroup").open = false;
+    window.scrollTo(0, 0);
     setSessionState("Recording\u2026");
     ui.clearBtn.disabled = true;
 
-    // Show live forecast card (Phase 2), reset to its waiting state.
-    // LEFT starts on top by convention (no animation until a real lead lands).
-    ui.liveForcastCard.classList.remove("hidden");
-    state.lastDisplayedLeader = null;
-    ui.forecastLeft.classList.add("rank-top");
-    ui.forecastLeft.classList.remove("rank-bottom");
-    ui.forecastRight.classList.add("rank-bottom");
-    ui.forecastRight.classList.remove("rank-top");
-    ui.forecastLeft.querySelector(".forecast-percentage").textContent = "\u2014";
-    ui.forecastRight.querySelector(".forecast-percentage").textContent = "\u2014";
-    ui.forecastNote.textContent = "Waiting for data\u2026";
+    ui.liveForcastCard.classList.remove('hidden');
+    clearForecastPodium();
+    ui.forecastNote.textContent = 'Waiting for motion evidence…';
     setForecastStyle("provisional");   // nothing is firm until the braking freeze
 
     hapticTick(15);
@@ -1432,7 +1612,15 @@ async function loadMLModules() {
   }
 
   async function stopRecording() {
+    if (state.finishing) return;
+    state.finishing = true;
     state.recording = false;
+    state.nativeSave?.setRecording(false);
+    clearInterval(state.journalTimer);
+    ui.recordBtn.disabled = true;
+    ui.recordLabel.textContent = 'Saving…';
+    state.wakeLock?.release().catch(() => {});
+    state.wakeLock = null;
     window.removeEventListener("devicemotion", handleMotion);
     window.removeEventListener("deviceorientation", handleOrientation);
     window.removeEventListener("deviceorientationabsolute", handleOrientation);
@@ -1466,7 +1654,9 @@ async function loadMLModules() {
     setSessionState(hasData ? "Recorded" : "Idle");
     ui.clearBtn.disabled = !hasData;
 
-    // Update predict/label button states
+    // Finish is durable BEFORE the label sheet; Skip still preserves the trip.
+    await protectRecording(true);
+    state.sync?.setRecording(false);
     await updateTrainingStatus();
 
     hapticTick(8);
@@ -1489,9 +1679,16 @@ async function loadMLModules() {
         if (label && label !== "skip") {
           // Also refreshes the fork engine's calibration with the new trip.
           await labelAndSaveToTrainingSet(label);
+          await state.sync?.updateRecording(state.recordingId, { label }).catch(showCloudError);
+          await prepareNativeRecording(state.recordingId).catch(showCloudError);
         }
       }
     }
+    state.finishing = false;
+    ui.recordBtn.disabled = false;
+    ui.recordLabel.textContent = 'Start recording';
+    ui.saveOneDriveBtn.disabled=!state.nativeSave?.supported();
+    await renderLocalRecordings();
   }
 
   ui.recordBtn.addEventListener("click", () => {
@@ -1582,12 +1779,21 @@ async function loadMLModules() {
   // ---------- Clear --------------------------------------------------------
 
   ui.clearBtn.addEventListener("click", () => {
-    // An unlabeled recording isn't persisted, so confirm before discarding it.
-    if (state.data.length && !window.confirm("Discard this recording?")) {
+    const message = state.memoryUnsaved
+      ? 'This recording has NOT been saved. Discard its only remaining copy?'
+      : 'Clear the current screen? Saved recordings will remain on this device.';
+    if (state.data.length && !window.confirm(message)) {
       return;
     }
 
     state.data = [];
+    state.memoryUnsaved = false;
+    state.lastLivePrediction = null;
+    state.position = null;
+    state.trackView?.render(null,null);
+    clearForecastPodium();
+    document.getElementById('emergencyDownload')?.remove();
+    document.getElementById('retryLocalSave')?.remove();
     state.startTime = null;
     state.dataTrimmed = false;
     setSessionState("Idle");
@@ -1603,11 +1809,14 @@ async function loadMLModules() {
   // contain a time gap — the data itself stays valid.
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
+      if (state.recording) protectRecording(false);
       if (state.rafId !== null) {
         cancelAnimationFrame(state.rafId);
         state.rafId = null;
       }
     } else {
+      if (state.recording) requestWakeLock();
+      else state.sync?.retry().catch(() => {});
       resizeAllCanvases();
       scheduleRender();
     }
@@ -1617,11 +1826,13 @@ async function loadMLModules() {
   // (with an info log) if the file hasn't been added to the repo.
   function registerServiceWorker() {
     if ("serviceWorker" in navigator && window.isSecureContext) {
-      window.addEventListener("load", () => {
+      const register = () => {
         navigator.serviceWorker.register("./sw.js").catch((err) => {
           console.info("[MotionLab] Offline mode unavailable (no service worker):", err.message);
         });
-      });
+      };
+      if (document.readyState === 'complete') register();
+      else window.addEventListener('load', register, {once:true});
     }
   }
 
@@ -1670,6 +1881,7 @@ async function loadMLModules() {
       setSessionState("Serve this page over HTTPS");
     }
 
+    await initJourneyTools();
     registerServiceWorker();
     requestPersistentStorage(); // ask iOS not to evict our recordings
     setupResizeHandling();
@@ -1692,7 +1904,7 @@ async function loadMLModules() {
   // reachable from the console. Exposed read-side only for the helpers
   // documented in README.md (e.g. `motionLab.state.trainSet.getStats()`).
   if (typeof window !== "undefined") {
-    window.motionLab = { state };
+    window.motionLab = { state, makeLivePrediction, protectRecording };
   }
 
   init();

@@ -1,0 +1,6 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Local OneDrive encryption key</title>
+<style>body{font:18px system-ui;max-width:40rem;margin:3rem auto;padding:1rem}button,input{font:inherit;padding:.7rem}input{width:100%;box-sizing:border-box}</style>
+<h1>Generate a private server encryption key</h1><p>This local page sends nothing over the network. Copy the generated value into the Cloudflare <strong>TOKEN_ENCRYPTION_KEY</strong> secret, then close this page. Do not save the value in the repository or chat.</p>
+<button id="generate">Generate key</button><p><input id="key" readonly aria-label="Generated private key"></p>
+<script>document.getElementById('generate').onclick=()=>{const bytes=crypto.getRandomValues(new Uint8Array(32));const value=btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');const field=document.getElementById('key');field.value=value;field.select();};</script>
+</html>

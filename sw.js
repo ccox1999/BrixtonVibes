@@ -11,7 +11,7 @@
 
 "use strict";
 
-const CACHE_VERSION = "brixtonvibes-v38";
+const CACHE_VERSION = "brixtonvibes-v41";
 
 // Everything the app needs to boot with no network at all.
 const APP_SHELL = [
@@ -24,6 +24,11 @@ const APP_SHELL = [
   "./training-set.js",
   "./raw-store.js",
   "./fork-engine.js",
+  "./track-position.js",
+  "./track-reference.js",
+  "./track-view.js",
+  "./onedrive-sync.js",
+  "./native-save.js",
   "./manifest.json",
   "./icon-192.png",
   "./icon-512.png",
@@ -50,7 +55,7 @@ self.addEventListener("activate", (event) => {
       .then((keys) =>
         Promise.all(
           keys
-            .filter((key) => key !== CACHE_VERSION)
+            .filter((key) => key.startsWith('brixtonvibes-') && key !== CACHE_VERSION)
             .map((key) => caches.delete(key))
         )
       )
@@ -58,17 +63,21 @@ self.addEventListener("activate", (event) => {
   );
 });
 
-// Fetch: cache-first for speed/offline, with a background network
-// refresh so the cache converges on the latest deploy.
+// Fetch: one coherent cached app shell. A bumped worker installs the next
+// complete version. API/auth responses never enter the cache.
 self.addEventListener("fetch", (event) => {
   const { request } = event;
 
   // Only handle same-origin GETs; let everything else pass through.
   if (request.method !== "GET") return;
   if (new URL(request.url).origin !== self.location.origin) return;
+  if (new URL(request.url).pathname.startsWith('/api/')) return;
 
   event.respondWith(
     caches.match(request).then((cached) => {
+      // Shell files belong to one version. Mixing background-refreshed modules
+      // with an older app can break recordings; updates install atomically.
+      if (cached) return cached;
       // Refresh the cache in the background (ignore failures — offline).
       const refresh = fetch(request)
         .then((response) => {
@@ -79,8 +88,6 @@ self.addEventListener("fetch", (event) => {
           return response;
         })
         .catch(() => undefined);
-
-      if (cached) return cached;
 
       // Nothing cached: wait for the network, and for page navigations
       // fall back to the cached shell so the app still opens offline.

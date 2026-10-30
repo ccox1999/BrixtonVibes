@@ -1,0 +1,82 @@
+{
+  "generatedBy": "node tools/analyze-track.mjs <snapshots> --build",
+  "trips": 42,
+  "validation": "Leave-one-journey-out; proxy target is completed-journey moving-time fraction, NOT independently measured physical position.",
+  "snapshots": [
+    {
+      "file": "victoria-training-2026-09-27-19L16R.json",
+      "count": 35,
+      "uniqueAdded": 35
+    },
+    {
+      "file": "victoria-training-2026-10-30-21L21R.json",
+      "count": 42,
+      "uniqueAdded": 7
+    }
+  ],
+  "methods": {
+    "moving-clock": {
+      "meanAbsoluteProxyError": 0.043591242570308865,
+      "meanIntervalCoverageOfProxy": null,
+      "meanIntervalWidth": null
+    },
+    "unconstrained-nearest": {
+      "meanAbsoluteProxyError": 0.23378952178699314,
+      "meanIntervalCoverageOfProxy": null,
+      "meanIntervalWidth": null
+    },
+    "filter-0": {
+      "meanAbsoluteProxyError": 0.045926983628848804,
+      "meanIntervalCoverageOfProxy": 1,
+      "meanIntervalWidth": 0.33447915840648035
+    },
+    "filter-0.06": {
+      "meanAbsoluteProxyError": 0.042548524496725616,
+      "meanIntervalCoverageOfProxy": 1,
+      "meanIntervalWidth": 0.3405764840783382
+    },
+    "filter-0.15": {
+      "meanAbsoluteProxyError": 0.043837909533218755,
+      "meanIntervalCoverageOfProxy": 1,
+      "meanIntervalWidth": 0.3490352284385977
+    }
+  },
+  "durations": {
+    "elapsedMin": 90.899,
+    "elapsedMax": 161.649,
+    "movingMin": 51,
+    "movingMax": 94
+  },
+  "inserted30sStops": {
+    "trips": 42,
+    "maximumProgressDrift": 0,
+    "elapsedClockMaximumDrift": 0.37037037037037035
+  },
+  "sampleLevelInserted30sStops": {
+    "trips": 42,
+    "maximumProgressDriftAfter2sSettling": 0,
+    "maximumAdvanceDuringFirst2s": 0.015436781449625625,
+    "maximumEndProgressDifference": 0.011724642667362284,
+    "caveat": "First partial one-second observation can still include preceding movement. Boundary mixtures can slightly change movement classification after restarting; quiet dwell itself is excluded from cruise estimation."
+  },
+  "chronological": {
+    "train": 35,
+    "test": 7,
+    "cutoff": "2026-09-28",
+    "meanAbsoluteProxyError": 0.028511865440044557,
+    "movingClockMeanAbsoluteProxyError": 0.03516255443055815,
+    "caveat": "Filter was developed after seeing these recordings; this split excludes test journeys from its reference, not from engineering decisions."
+  },
+  "largestOneSecondCorrection": {
+    "forward": 0.0163695370847039,
+    "backward": 0
+  },
+  "invalidFrameCount": 131,
+  "naivePhonePlaneIntegration": {
+    "caveat": "Uncorrected phone x/y PCA, arbitrary sign, assumes zero initial speed. A failure demonstration, not a track reconstruction.",
+    "distanceMin": -2099.2585702198407,
+    "distanceMax": 2119.627800898642,
+    "finalVelocityMin": -34.848412924185396,
+    "finalVelocityMax": 33.44363800840347
+  }
+}

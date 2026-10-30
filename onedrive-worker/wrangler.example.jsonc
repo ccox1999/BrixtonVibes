@@ -1,0 +1,15 @@
+{
+  "name": "brixtonvibes",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-10-30",
+  "triggers": { "crons": ["17 3 * * 0"] },
+  "assets": { "directory": "../.onedrive-public", "binding": "ASSETS", "run_worker_first": ["/api/*"] },
+  "vars": {
+    "APP_ORIGIN": "https://YOUR-WORKER.YOUR-SUBDOMAIN.workers.dev",
+    "MICROSOFT_CLIENT_ID": "YOUR-PUBLIC-APPLICATION-CLIENT-ID",
+    "ALLOWED_TENANT_ID": "9188040d-6c67-4c5b-b112-36a304b66dad"
+  },
+  "d1_databases": [{ "binding": "DB", "database_name": "brixtonvibes-auth", "database_id": "YOUR-D1-DATABASE-ID" }]
+  // Secrets, set in the Cloudflare dashboard (never in this file):
+  // MICROSOFT_CLIENT_SECRET, TOKEN_ENCRYPTION_KEY, ALLOWED_OBJECT_ID
+}

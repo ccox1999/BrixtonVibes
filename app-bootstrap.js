@@ -1,6 +1,6 @@
 // Start the app only after a coherent offline shell is ready. This file and
 // the CSS use a release URL, so a legacy worker cannot serve their old copies.
-const RELEASE = "42";
+const RELEASE = "43";
 const workerURL = new URL(`./sw.js?v=${RELEASE}`, location.href).href;
 const workerContainer = navigator.serviceWorker;
 let appStarted = false;

@@ -33,7 +33,14 @@ const T_FLIPS = 0.2;         // changes of the shown side after the first firm c
 function parseArgs(argv) {
   const out = { files: [], trainBefore: null, trips: false };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--train-before") out.trainBefore = Date.parse(argv[++i]);
+    if (argv[i] === "--train-before") {
+      const value = argv[++i];
+      const parsed = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) ? Date.parse(value) : NaN;
+      if (!Number.isFinite(parsed) || new Date(parsed).toISOString().slice(0,10) !== value) {
+        throw new Error('--train-before requires a valid YYYY-MM-DD date; refusing to substitute leave-one-out results.');
+      }
+      out.trainBefore = parsed;
+    }
     else if (argv[i] === "--trips") out.trips = true;
     else if (argv[i].startsWith('--')) throw new Error(`Unknown option ${argv[i]}`);
     else out.files.push(argv[i]);
@@ -128,10 +135,11 @@ const trips = loadTrips(args.files);
 const asExamples = (ts) => ts.map((t) => ({ label: t.label, rawMotionData: t.raw }));
 
 let rows, title;
-if (args.trainBefore) {
+if (args.trainBefore !== null) {
   const train = trips.filter((t) => t.timestamp < args.trainBefore);
   const test = trips.filter((t) => t.timestamp >= args.trainBefore);
   const cal = calibrate(asExamples(train));
+  if (!cal.liveYaw || !cal.liveSkew) throw new Error('The chronological split needs at least three usable training journeys per platform.');
   rows = test.map((t) => score(t, cal));
   title = `PROSPECTIVE: calibrated on ${train.length} trips before ${new Date(args.trainBefore).toISOString().slice(0, 10)}, scored on ${test.length} after`;
 } else {

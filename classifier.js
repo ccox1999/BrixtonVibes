@@ -53,14 +53,14 @@ export class KNNClassifier {
       throw new Error(`Invalid label: ${label}. Must be "left" or "right".`);
     }
 
-    if (!features || typeof features !== "object") {
+    if (!features || typeof features !== "object" || Array.isArray(features)) {
       throw new Error("Features must be a non-null object.");
     }
 
     this.examples.push({
+      ...metadata,
       features: { ...features },
       label,
-      ...metadata,
     });
     this._normCache = null; // stats are stale now
   }
@@ -426,7 +426,10 @@ export class LogisticRegression {
     if (!["left", "right"].includes(label)) {
       throw new Error(`Invalid label: ${label}. Must be "left" or "right".`);
     }
-    this.examples.push({ features: { ...features }, label, ...metadata });
+    if (!features || typeof features !== "object" || Array.isArray(features)) {
+      throw new Error("Features must be a non-null object.");
+    }
+    this.examples.push({ ...metadata, features: { ...features }, label });
     this._trained = false;
   }
 
@@ -456,11 +459,11 @@ export class LogisticRegression {
     // gradient descent is well conditioned.
     for (const k of this.keys) {
       let s = 0;
-      for (const e of ex) s += e.features[k] ?? 0;
+      for (const e of ex) s += Number.isFinite(e.features[k]) ? e.features[k] : 0;
       const m = s / n;
       let sq = 0;
       for (const e of ex) {
-        const d = (e.features[k] ?? 0) - m;
+        const d = (Number.isFinite(e.features[k]) ? e.features[k] : 0) - m;
         sq += d * d;
       }
       this.mean[k] = m;
@@ -470,7 +473,7 @@ export class LogisticRegression {
     const y = ex.map((e) => (e.label === "left" ? 1 : 0));
     const X = ex.map((e) => {
       const v = {};
-      for (const k of this.keys) v[k] = ((e.features[k] ?? this.mean[k]) - this.mean[k]) / this.std[k];
+      for (const k of this.keys) v[k] = ((Number.isFinite(e.features[k]) ? e.features[k] : this.mean[k]) - this.mean[k]) / this.std[k];
       return v;
     });
 
@@ -608,17 +611,17 @@ function rankFeatures(rows) {
   const std = {};
   for (const k of keyArr) {
     let s = 0;
-    for (const r of rows) s += r.features[k] ?? 0;
+    for (const r of rows) s += Number.isFinite(r.features[k]) ? r.features[k] : 0;
     const m = s / n;
     let sq = 0;
     for (const r of rows) {
-      const d = (r.features[k] ?? 0) - m;
+      const d = (Number.isFinite(r.features[k]) ? r.features[k] : 0) - m;
       sq += d * d;
     }
     mean[k] = m;
     std[k] = Math.max(1e-6, Math.sqrt(sq / n));
   }
-  const z = (r, k) => ((r.features[k] ?? mean[k]) - mean[k]) / std[k];
+  const z = (r, k) => ((Number.isFinite(r.features[k]) ? r.features[k] : mean[k]) - mean[k]) / std[k];
 
   const L = rows.filter((r) => r.label === "left");
   const R = rows.filter((r) => r.label === "right");

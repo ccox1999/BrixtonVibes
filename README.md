@@ -4,7 +4,29 @@ A hands-free Victoria line platform forecast for Stockwell → Brixton. The app
 runs as a static site on GitHub Pages, including offline recording. The **Save to OneDrive** button uses the iPhone system sheet and existing
 OneDrive account, with no new signup, server, card details, or running laptop.
 
-## October development results
+## November review — release v43
+
+The newest export contains **46 distinct journeys, 23 left / 23 right**. It
+retains October's 42 and adds four. Calibration frozen on October gets **3/4**
+new journeys correct at Finish; the 5 November left-platform trip is the miss.
+Across all 46, leaving each journey out of its own calibration gives **40/46
+(87.0%)** correct at Finish, **36/46** at 12 seconds and **25/46** at 16 seconds.
+The fixes preserve those branch decisions; they do not establish an earlier
+reliable call. Compass accuracy on the new journeys is poor and it remains
+recorded data rather than a prediction override.
+
+Version 7 of the prediction engine fixes recovery after interrupted sensors,
+stale timestamps and incomplete evidence windows. The wider review fixes
+concurrent recording edits, failed deletion/import preservation, stale compass
+capture and late calibration/wake-lock changes, and improves keyboard access and
+recording recovery. The bundled relative-motion reference now uses all 46 trips.
+Full findings and checks are in [the November project review](docs/november-review.md)
+and [the detailed prediction review](docs/november-algorithm-review.md).
+
+Release v43 deploys from `main` through the existing GitHub Pages site. Physical
+iPhone sensor recording and actual OneDrive delivery still require a phone check.
+
+## October development results (historical)
 
 The October export contains **42 unique journeys, 21 left / 21 right**:
 September's 35 plus seven new journeys. Original recordings remain private and
@@ -64,10 +86,12 @@ crossover geometry or independent junction times. No kilometres, speed, tunnel
 radii, or geographical coordinates are invented.
 
 Matching modestly improves error against an internal movement-progress proxy
-(4.25 versus 4.36 percentage points), which cannot establish real physical
+(3.96 versus 4.08 percentage points across the latest 46 journeys), which cannot establish real physical
 position accuracy. Inserted 30-second stops produce no drift after settling,
 with small boundary effects. [Track methods and results](docs/track-reference.md)
-explain reconstruction limits and alternatives.
+explain the live estimator. [The inertial path reconstruction study](docs/track-shape-reconstruction.md)
+compares speed-aware gyro/acceleration paths and explains why they are not yet
+used as a physical map.
 
 ## OneDrive without new accounts, cards, or a laptop
 
@@ -113,7 +137,7 @@ Existing storage names `victoria-line-training-set` and `motion-lab-raw` remain
 unchanged. The independent journal uses `brixtonvibes-recording-outbox`.
 
 If an older installation still shows the chart dashboard, open
-[`update.html?release=42`](https://ccox1999.github.io/BrixtonVibes/update.html?release=42)
+[`update.html?release=43`](https://ccox1999.github.io/BrixtonVibes/update.html?release=43)
 while not recording. It installs the current app files and reopens the app;
 it never clears saved recordings, labels, localStorage or IndexedDB.
 
@@ -136,8 +160,10 @@ npm install
 npm test
 npm run test:browser
 npm run test:update
+npm run test:journal
+npm run verify
 node analyze-development.mjs victoria-training-2026-09-27-19L16R.json victoria-training-2026-10-30-21L21R.json
-node tools/analyze-track.mjs victoria-training-2026-09-27-19L16R.json victoria-training-2026-10-30-21L21R.json --build
+node tools/analyze-track.mjs victoria-training-2026-09-27-19L16R.json victoria-training-2026-10-30-21L21R.json victoria-training-2026-11-08-23L23R.json --build
 node onedrive-worker/build-assets.mjs
 ```
 
@@ -149,3 +175,7 @@ viewports, tests reload recovery and offline startup, and writes screenshots to
 ignored `test-results/`. Private raw files are necessary for the replay/analysis,
 but not the small synthetic unit tests. The cloud static builder copies an
 explicit allowlist and excludes raw exports and server configuration.
+
+`npm run verify` runs the full local sequence (unit/backend checks, mobile app
+replay, real IndexedDB checks, old-installation updates and the public asset
+build), stopping on failure. It does not upload recordings or publish the app.

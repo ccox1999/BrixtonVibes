@@ -1,4 +1,4 @@
-import { activateRelease } from "./app-bootstrap.js?v=42";
+import { activateRelease } from "./app-bootstrap.js?v=43";
 const status = document.getElementById("updateStatus");
 const retry = document.getElementById("retryUpdateBtn");
 async function update() {
@@ -7,12 +7,12 @@ async function update() {
     "Downloading the current app. Your saved journeys stay on this device.";
   try {
     if (!navigator.serviceWorker) {
-      location.replace("./?release=42");
+      location.replace("./?release=43");
       return;
     }
     await activateRelease(navigator.serviceWorker);
     status.textContent = "Update ready. Opening the app…";
-    location.replace("./?release=42");
+    location.replace("./?release=43");
   } catch (error) {
     status.textContent = error.message;
     retry.classList.remove("hidden");

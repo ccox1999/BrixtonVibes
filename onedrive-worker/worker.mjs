@@ -11,7 +11,11 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 const microsoftKeys = createRemoteJWKSet(new URL("https://login.microsoftonline.com/common/discovery/v2.0/keys"));
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff", ...headers } });
-const b64 = value => btoa(String.fromCharCode(...value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const b64 = value => {
+  let binary = "";
+  for (let offset = 0; offset < value.length; offset += 32768) binary += String.fromCharCode(...value.subarray(offset, offset + 32768));
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
 const unb64 = value => Uint8Array.from(atob(value.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
 const random = () => b64(crypto.getRandomValues(new Uint8Array(32)));
 const hash = async value => b64(new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(value))));
@@ -22,7 +26,7 @@ function tenant(env) { return env.ALLOWED_TENANT_ID || PERSONAL_TENANT; }
 function authority(env) { return `https://login.microsoftonline.com/${tenant(env) === PERSONAL_TENANT ? "consumers" : tenant(env)}/oauth2/v2.0`; }
 function callbackUri(env) { return `${env.APP_ORIGIN}/api/onedrive/callback`; }
 export function validateOwner(claims, env) {
-  return typeof claims.oid === "string" && claims.oid.toLowerCase() === env.ALLOWED_OBJECT_ID?.toLowerCase() && claims.tid?.toLowerCase() === tenant(env).toLowerCase();
+  return typeof claims?.oid === "string" && typeof claims.tid === "string" && claims.oid.toLowerCase() === env.ALLOWED_OBJECT_ID?.toLowerCase() && claims.tid.toLowerCase() === tenant(env).toLowerCase();
 }
 export async function verifyMicrosoftIdToken(token, env, keys = microsoftKeys) {
   return (await jwtVerify(token, keys, { algorithms: ["RS256"], audience: env.MICROSOFT_CLIENT_ID, issuer: `https://login.microsoftonline.com/${tenant(env)}/v2.0`, clockTolerance: 30, requiredClaims: ["exp", "iat", "sub", "oid", "tid", "nonce"] })).payload;
@@ -78,7 +82,7 @@ async function graphToken(env, sessionId, session, fetchImpl, force = false) {
 }
 export function validateRecording(value, id) {
   const ex = value?.examples?.[0];
-  return value?.version === 3 && value.complete === true && value.recordingId === id && Array.isArray(value.examples) && value.examples.length === 1 && ex?.recordingId === id && ex.complete !== false && Array.isArray(ex.rawMotionData) && ex.rawMotionData.length > 0 && ex.rawMotionData.length <= 250000;
+  return value?.version === 3 && value.complete === true && value.recordingId === id && Array.isArray(value.examples) && value.examples.length === 1 && ex?.recordingId === id && ex.complete !== false && Array.isArray(ex.rawMotionData) && ex.rawMotionData.length > 0 && ex.rawMotionData.length <= 250000 && ex.rawMotionData.every(sample => sample && typeof sample === "object" && !Array.isArray(sample) && Number.isFinite(sample.time));
 }
 
 export async function handleRequest(request, env, { fetchImpl = fetch, verifyIdToken } = {}) {

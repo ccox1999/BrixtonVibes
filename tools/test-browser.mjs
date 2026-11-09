@@ -6,6 +6,8 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import {fileURLToPath} from 'node:url';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
+const recordingName = process.argv[2] || (await fs.readdir(root)).filter(name=>/^victoria-training-\d{4}-\d{2}-\d{2}-\d+L\d+R\.json$/.test(name)).sort().at(-1);
+if (!recordingName || path.basename(recordingName)!==recordingName) throw new Error('A local training export filename is required');
 const out=path.join(root,'test-results'); await fs.mkdir(out,{recursive:true});
 const types={'.html':'text/html','.js':'text/javascript','.css':'text/css','.json':'application/json','.png':'image/png'};
 const server=http.createServer(async(req,res)=>{try{
@@ -21,10 +23,12 @@ const checks=[],errors=[],apiRequests=[];
 const check=(name,value)=>{assert.ok(value,name);checks.push(name);console.log('PASS',name);};
 try{
   const page=await browser.newPage({viewport:{width:390,height:844},deviceScaleFactor:2,hasTouch:true,isMobile:true});
-  // Mock only the OS share target; actual IndexedDB, app, click and File bytes
-  // remain real. Desktop automation cannot open iOS's OneDrive provider.
+  // Mock OS prompts and share target; actual IndexedDB, app, click and File
+  // bytes remain real. Desktop automation cannot open iOS's OneDrive provider.
   await page.addInitScript(()=>{
     window.shareCalls=[];window.shareMode='success';
+    Object.defineProperty(DeviceMotionEvent,'requestPermission',{configurable:true,value:()=>Promise.resolve('granted')});
+    Object.defineProperty(DeviceOrientationEvent,'requestPermission',{configurable:true,value:()=>new Promise(()=>{})});
     Object.defineProperty(navigator,'canShare',{configurable:true,value:({files})=>Array.isArray(files)&&files[0] instanceof File});
     Object.defineProperty(navigator,'share',{configurable:true,value:data=>{
       window.shareCalls.push({file:data.files[0],active:navigator.userActivation.isActive});
@@ -35,17 +39,20 @@ try{
   page.on('request',request=>{if(request.url().includes('/api/onedrive/'))apiRequests.push(request.url());});
   console.log('Loading app');
   await page.goto(url);await page.waitForFunction(()=>window.motionLab?.state.sync);
-  const dataset=JSON.parse(await fs.readFile(path.join(root,'victoria-training-2026-10-30-21L21R.json'),'utf8'));
+  const dataset=JSON.parse((await fs.readFile(path.join(root,recordingName),'utf8')).replace(/^\uFEFF/,''));
   const seed=dataset.examples.filter(e=>e.rawMotionData?.length);
   console.log('Seeding history through same-origin local fixture');
-  await page.evaluate(async ()=>{
-    const {examples}=await (await fetch('./victoria-training-2026-10-30-21L21R.json')).json();
+  await page.waitForFunction(()=>window.motionLab?.state.trainSet);
+  await page.evaluate(async name=>{
+    const {examples}=await (await fetch('./'+name)).json();
     const {TrainingSet}=await import('./training-set.js');
     const set=new TrainingSet();set.fromJSON({version:3,examples});await set.save();
-  });
+  },recordingName);
   console.log('Reloading and calibrating');
   await page.reload();await page.waitForFunction(()=>window.motionLab?.state.forkCal?.liveYaw,{timeout:60000});
-  await page.locator('#sensorBtn').click();await page.locator('#recordBtn').click();
+  await page.locator('#sensorBtn').click();
+  check('An unanswered optional compass permission cannot block granted motion recording',await page.locator('#recordBtn').isEnabled());
+  await page.locator('#recordBtn').click();
   const start=await page.evaluate(()=>{const s=motionLab.state;cancelAnimationFrame(s.rafId);s.rafId=null;clearInterval(s.journalTimer);s.lastPredictionAt=Infinity;return {recording:s.recording,oneProbability:document.querySelectorAll('#forecastProbability').length,toolsVisible:!!document.querySelector('#toolsGroup').getClientRects().length};});
   check('Recording starts and hides settings',start.recording&&!start.toolsVisible);
   check('Exactly one direction probability element',start.oneProbability===1);
@@ -61,6 +68,7 @@ try{
   check('Historical live replay drives sensor-derived track marker',replay.position.progress>0&&replay.view.includes('Relative movement'));
   check('Live replay produces one platform prediction',/platform/.test(replay.snapshots.at(-1).direction)&&/\d+%/.test(replay.snapshots.at(-1).probability));
   check('Position has broad bounds and no invented junction',replay.position.lower<replay.position.progress&&replay.position.upper>replay.position.progress&&replay.position.junction.progress===null);
+  check('Relative movement never claims 100 percent arrival',!/100%/.test(await page.locator('#trackProgress').textContent()));
   // Accelerated fixture delivered a full journey in one turn. Let the automatic
   // marker animation settle before inspecting its actual final on-track position.
   await page.waitForTimeout(900);
@@ -75,7 +83,11 @@ try{
   await page.locator('#recordBtn').click();await page.locator('[data-answer="skip"]').waitFor();
   check('Finish saves before asking for a label',await page.evaluate(async()=>{const row=await motionLab.state.sync.getRecording(motionLab.state.recordingId);return row?.complete&&row.payload.rawMotionData.length>1000;}));
   check('Finish preserves exact live direction and probability',before===await page.locator('#forecastDirection').textContent()&&prob===await page.locator('#forecastProbability').textContent());
-  await page.locator('[data-answer="skip"]').click();await page.waitForFunction(()=>!motionLab.state.finishing);
+  check('Label sheet exposes a named dialog and contains background interaction',await page.evaluate(()=>document.querySelector('[role="dialog"]')?.getAttribute('aria-labelledby')==='tripLabelTitle'&&document.querySelector('.app-shell').inert&&document.activeElement.dataset.answer==='skip'));
+  await page.keyboard.press('Tab');
+  check('Label sheet traps keyboard focus inside its choices',await page.locator('[data-answer="left"]').evaluate(el=>el===document.activeElement));
+  await page.keyboard.press('Escape');await page.waitForFunction(()=>!motionLab.state.finishing);
+  check('Escape skips the label and restores the app controls',await page.evaluate(()=>!document.querySelector('[role="dialog"]')&&!document.querySelector('.app-shell').inert));
   check('Finished recording offers a visible OneDrive save button',await page.locator('#saveOneDriveBtn').isVisible()&&await page.locator('#saveOneDriveBtn').isEnabled());
   await page.screenshot({path:path.join(out,'iphone-finished-onedrive.png')});
   await page.locator('#saveOneDriveBtn').click();
@@ -98,15 +110,70 @@ try{
   await page.locator('#sensorBtn').click();await page.locator('#recordBtn').click();
   const missing=await page.evaluate(()=>{dispatchEvent(new DeviceMotionEvent('devicemotion'));return motionLab.state.data.at(-1);});
   check('Missing sensors remain null instead of fake zero readings',missing.ax===null&&missing.gx===null&&missing.rotationAlpha===null);
+  const compass = await page.evaluate(()=>{
+    const orientation = values=>dispatchEvent(Object.assign(new Event('deviceorientation'),values));
+    const sample = ()=>{dispatchEvent(new DeviceMotionEvent('devicemotion'));return motionLab.state.data.at(-1);};
+    orientation({webkitCompassHeading:-10,webkitCompassAccuracy:8});
+    const fresh=sample();motionLab.state.lastOrientationAt-=1001;
+    const stale=sample();
+    orientation({webkitCompassHeading:30,webkitCompassAccuracy:8});
+    orientation({webkitCompassHeading:null});
+    return {fresh,stale,unavailable:sample()};
+  });
+  check('Compass normalizes bearings and never repeats stale or unavailable readings',compass.fresh.heading===350&&compass.fresh.headingAccuracy===8&&compass.stale.heading===null&&compass.stale.headingAccuracy===null&&compass.unavailable.heading===null);
   await page.evaluate(async()=>{const store=motionLab.state.sync.store;window.originalPut=store.put;store.put=async()=>{throw new Error('Simulated full storage');};await motionLab.protectRecording(false);});
   await page.setViewportSize({width:320,height:568});
   check('Storage failure during capture needs no extra touch controls',await page.evaluate(()=>!document.querySelector('#emergencyDownload')&&!document.querySelector('#retryLocalSave')&&document.querySelector('#saveStatus').getBoundingClientRect().bottom<=innerHeight));
   await page.locator('#recordBtn').click();await page.locator('[data-answer="skip"]').click();await page.waitForFunction(()=>!motionLab.state.finishing);
   await page.locator('#recordBtn').click();
   check('Unsaved recording cannot be overwritten by a new Start',await page.evaluate(()=>motionLab.state.memoryUnsaved&&!motionLab.state.recording&&!!document.querySelector('#retryLocalSave')));
+  const rescueFile=await page.evaluate(()=>motionLab.state.nativeSave.file.name);
+  await page.locator('#toolsGroup').evaluate(el=>{el.open=true;});
+  await page.locator('.local-recording button').first().click();
+  check('Selecting history cannot replace the rescue file of an unsaved recording',await page.evaluate(name=>motionLab.state.nativeSave.file.name===name&&document.querySelector('#saveStatus').textContent.includes('Retry saving the current recording'),rescueFile));
+  await page.locator('#toolsGroup').evaluate(el=>{el.open=false;});
+  await page.evaluate(()=>{
+    Object.defineProperty(navigator,'canShare',{configurable:true,value:()=>false});
+    document.querySelector('#emergencyDownload').remove();
+  });
+  await page.locator('#recordBtn').click();
+  const downloadReady=await page.locator('#emergencyDownload').textContent();
+  check('Unsaved recording offers a working download when native sharing is unavailable',downloadReady==='Download unsaved recording'&&await page.locator('#emergencyDownload').isEnabled());
+  const download=page.waitForEvent('download');await page.locator('#emergencyDownload').click();
+  check('Emergency download contains the current recording filename',(await download).suggestedFilename()===rescueFile);
   await page.evaluate(()=>{motionLab.state.sync.store.put=window.originalPut;});
   await page.locator('#retryLocalSave').click();await page.waitForFunction(()=>!motionLab.state.memoryUnsaved);
   check('Failed local save can be retried without losing samples',await page.evaluate(async()=>{const row=await motionLab.state.sync.getRecording(motionLab.state.recordingId);return row.complete&&row.payload.rawMotionData.length>0&&!document.querySelector('#retryLocalSave');}));
+  // Delay the real history reads used by recalibration, then begin a journey.
+  // Its confidence and position reference must remain fixed until Finish.
+  await page.evaluate(()=>{
+    const s=motionLab.state;
+    window.beforeCalibration=s.forkCal;window.beforeReference=s.trackReference;
+    window.originalRawRead=s.trainSet.getRawMotionData;
+    const gate=new Promise(resolve=>{window.releaseCalibration=resolve;});
+    window.calibrationReads=0;
+    s.trainSet.getRawMotionData=async function(id){window.calibrationBlocked=true;await gate;const raw=await originalRawRead.call(this,id);window.calibrationReads++;return raw;};
+    Object.defineProperty(navigator,'wakeLock',{configurable:true,value:{request:()=>new Promise(resolve=>{window.resolveWakeLock=resolve;})}});
+  });
+  page.once('dialog',dialog=>dialog.accept());
+  await page.locator('.recording-delete').first().click();
+  await page.waitForFunction(()=>window.calibrationBlocked);
+  await page.locator('#recordBtn').click();
+  await page.evaluate(()=>window.releaseCalibration());
+  await page.waitForFunction(()=>window.calibrationReads===motionLab.state.trainSet.count());
+  check('A calibration finishing after Start cannot change the active journey',await page.evaluate(()=>motionLab.state.forkCal===beforeCalibration&&motionLab.state.trackReference===beforeReference&&motionLab.state.calibrationDeferred));
+  await page.evaluate(()=>{motionLab.state.trainSet.getRawMotionData=originalRawRead;});
+  await page.locator('#recordBtn').click();
+  await page.waitForFunction(()=>!motionLab.state.finishing||document.querySelector('[data-answer="skip"]'));
+  if (await page.locator('[data-answer="skip"]').count()) await page.locator('[data-answer="skip"]').click();
+  await page.waitForFunction(()=>!motionLab.state.finishing);
+  check('Deferred calibration is applied after Finish for the next journey',await page.evaluate(()=>!motionLab.state.calibrationDeferred&&motionLab.state.forkCal!==beforeCalibration));
+  await page.evaluate(()=>{
+    window.lateWakeLock={released:false,release:async function(){this.released=true;}};
+    window.resolveWakeLock(lateWakeLock);
+  });
+  await page.waitForFunction(()=>window.lateWakeLock.released);
+  check('A screen wake lock granted after Finish is released immediately',await page.evaluate(()=>!motionLab.state.wakeLock&&lateWakeLock.released));
   check('No uncaught browser errors',errors.length===0);
   check('Native-only recording and saving never contact an extra backend',apiRequests.length===0);
   // Cache installed shell, then prove full offline reload initializes modules.

@@ -34,6 +34,7 @@ export class TrainingSet {
     this.storageKey = storageKey;
     this.examples = []; // [{id, features, label, timestamp, recordingId, notes}, ...]
     this.nextId = 1;
+    this.pendingRawDeletes = new Set();
   }
 
   /**
@@ -120,7 +121,7 @@ export class TrainingSet {
     if (Array.isArray(ex.rawMotionData) && ex.rawMotionData.length > 0) {
       return ex.rawMotionData;
     }
-    return getRaw(ex.recordingId);
+    return getRaw(ex.recordingId || ex.id);
   }
 
   /**
@@ -141,6 +142,7 @@ export class TrainingSet {
     //    in-memory copy once the write reports success.
     for (const ex of this.examples) {
       if (!Array.isArray(ex.rawMotionData) || ex.rawMotionData.length === 0) continue;
+      if (!ex.recordingId) ex.recordingId = ex.id;
       const stored = await putRaw(ex.recordingId, ex.rawMotionData);
       if (stored) {
         delete ex.rawMotionData;
@@ -157,6 +159,7 @@ export class TrainingSet {
     try {
       const jsonStr = JSON.stringify(this.toJSON());
       localStorage.setItem(this.storageKey, jsonStr);
+      await this.deleteRemovedRaw();
       const sizeKB = new Blob([jsonStr]).size / 1024;
       console.log(`[TrainingSet] Saved ${this.examples.length} examples to localStorage (${sizeKB.toFixed(1)} KB)`);
       return;
@@ -169,14 +172,14 @@ export class TrainingSet {
           const lite = this.toJSON();
           for (const ex of lite.examples) delete ex.rawMotionData;
           localStorage.setItem(this.storageKey, JSON.stringify(lite));
-          console.warn(
-            "[TrainingSet] localStorage quota hit and IndexedDB unavailable — saved WITHOUT raw motion data. Export a backup to keep raw data."
-          );
-          return;
+          await this.deleteRemovedRaw();
         } catch (err2) {
           console.error("[TrainingSet] Save failed even without raw data:", err2);
           throw err2;
         }
+        const incomplete = new Error("Training labels were saved, but their raw sensor backup could not be stored. Export a backup to preserve those samples.");
+        incomplete.code = "RAW_STORAGE_UNAVAILABLE";
+        throw incomplete;
       }
       console.error("[TrainingSet] localStorage save failed:", err);
       throw err;
@@ -232,11 +235,22 @@ export class TrainingSet {
     const idx = this.examples.findIndex(ex => ex.id === id);
     if (idx >= 0) {
       const [removed] = this.examples.splice(idx, 1);
-      // Fire-and-forget: a failed delete only leaves an orphaned blob.
-      deleteRaw(removed.recordingId).catch(() => {});
+      // Keep raw data until save() durably removes its metadata too. A failed
+      // localStorage write must not leave a saved label pointing at lost raw.
+      this.pendingRawDeletes.add(removed.recordingId || removed.id);
       return true;
     }
     return false;
+  }
+
+  async deleteRemovedRaw() {
+    for (const recordingId of this.pendingRawDeletes) {
+      if (this.examples.some(ex => (ex.recordingId || ex.id) === recordingId)) {
+        this.pendingRawDeletes.delete(recordingId);
+      } else if (await deleteRaw(recordingId)) {
+        this.pendingRawDeletes.delete(recordingId);
+      }
+    }
   }
 
   /**
@@ -334,17 +348,40 @@ export class TrainingSet {
    * build (addTrainingExample throws on labels it doesn't recognise).
    */
   fromJSON(json) {
-    if (!json.examples || !Array.isArray(json.examples)) {
+    if (!json || !Array.isArray(json.examples)) {
       throw new Error("Invalid training set JSON format");
     }
 
     const usable = [];
+    const byRecording = new Map();
     let skipped = 0;
     for (const ex of json.examples) {
-      const label = typeof ex.label === "string" ? ex.label.toLowerCase() : "";
+      if (!ex || typeof ex !== "object" || Array.isArray(ex)) { skipped++; continue; }
+      if (ex.rawMotionData !== undefined) {
+        if (!Array.isArray(ex.rawMotionData)) throw new Error(`Invalid raw sensor data for ${ex.id || "imported journey"}`);
+        for (const sample of ex.rawMotionData) {
+          if (!sample || typeof sample !== "object" || Array.isArray(sample) || !Number.isFinite(sample.time)) {
+            throw new Error(`Invalid raw sensor sample for ${ex.id || "imported journey"}: a finite numeric time is required`);
+          }
+        }
+      }
+      const label = typeof ex.label === "string" ? ex.label.trim().toLowerCase() : "";
       const hasFeatures =
         ex.features && typeof ex.features === "object" && !Array.isArray(ex.features);
       if (hasFeatures && (label === "left" || label === "right")) {
+        if (typeof ex.recordingId === "string" && ex.recordingId) {
+          const previous = byRecording.get(ex.recordingId);
+          if (previous) {
+            const oldRaw = Array.isArray(previous.rawMotionData) && previous.rawMotionData.length > 0;
+            const newRaw = Array.isArray(ex.rawMotionData) && ex.rawMotionData.length > 0;
+            if (previous.label !== label || (oldRaw && newRaw && JSON.stringify(previous.rawMotionData) !== JSON.stringify(ex.rawMotionData))) {
+              throw new Error(`Conflicting journeys use the same recording ID: ${ex.recordingId}`);
+            }
+            if (!oldRaw && newRaw) { previous.rawMotionData = ex.rawMotionData; previous.hasRawData = true; }
+            skipped++;
+            continue;
+          }
+        }
         usable.push({
           id: ex.id,
           features: ex.features,
@@ -363,37 +400,47 @@ export class TrainingSet {
           approachProfile: ex.approachProfile,
           notes: ex.notes ?? "",
         });
+        if (typeof ex.recordingId === "string" && ex.recordingId) byRecording.set(ex.recordingId, usable.at(-1));
       } else {
         skipped++;
       }
     }
     if (skipped > 0) {
-      console.warn(`[TrainingSet] Skipped ${skipped} example(s) with no feature vector or invalid label`);
+      console.warn(`[TrainingSet] Skipped ${skipped} duplicate or unusable example(s)`);
     }
 
     this.examples = usable;
 
     // Resume ID numbering after the highest existing ID (0 when empty).
     const maxId = this.examples.reduce((max, ex) => {
-      const match = /example-(\d+)/.exec(ex.id ?? "");
+      const match = /^example-(\d+)$/.exec(ex.id ?? "");
       return match ? Math.max(max, parseInt(match[1], 10)) : max;
     }, 0);
     this.nextId = maxId + 1;
+    const ids = new Set();
+    for (const ex of this.examples) {
+      if (typeof ex.id !== "string" || !ex.id || ids.has(ex.id)) ex.id = `example-${this.nextId++}`;
+      ids.add(ex.id);
+      if (typeof ex.recordingId !== "string" || !ex.recordingId) ex.recordingId = undefined;
+    }
   }
 
   /**
    * Clear all training data (destructive) — including raw recordings.
    */
   async clear() {
-    this.examples = [];
-    this.nextId = 1;
-
+    // Remove the persisted labels FIRST. If that fails, both their in-memory
+    // copy and the raw recordings must remain recoverable.
     try {
       localStorage.removeItem(this.storageKey);
     } catch (err) {
       console.warn("[TrainingSet] Failed to clear localStorage:", err);
+      throw err;
     }
-    await clearRaw();
+    this.examples = [];
+    this.nextId = 1;
+    this.pendingRawDeletes.clear();
+    if (!await clearRaw()) throw new Error("Training labels were cleared, but the stored sensor files could not be removed. Try again.");
   }
 
   /**
@@ -518,21 +565,41 @@ export class TrainingSet {
     }, 0);
     this.nextId = Math.max(this.nextId, maxId + 1);
 
-    const existingIds = new Set(
-      this.examples.map(ex => ex.recordingId).filter(id => id != null)
-    );
+    const existingIds = new Map(this.examples.filter(ex => ex.recordingId != null).map(ex => [ex.recordingId, ex]));
     let merged = 0;
 
     for (const ex of otherTrainingSet.examples) {
-      if (ex.recordingId != null && existingIds.has(ex.recordingId)) continue;
+      if (ex.recordingId != null && existingIds.has(ex.recordingId)) {
+        continue;
+      }
       const id = `example-${this.nextId++}`;
       this.examples.push({ ...ex, id, recordingId: ex.recordingId ?? id });
-      if (ex.recordingId != null) existingIds.add(ex.recordingId);
+      existingIds.set(ex.recordingId ?? id, this.examples.at(-1));
       merged++;
     }
 
     console.log(`[TrainingSet] Merged ${merged} new examples`);
     return merged;
+  }
+
+  /** Repair absent raw data without replacing any healthy saved recording. */
+  async restoreRawFrom(otherTrainingSet) {
+    let repaired = 0;
+    const byRecording = new Map(this.examples.filter(ex => ex.recordingId != null).map(ex => [ex.recordingId, ex]));
+    for (const incoming of otherTrainingSet.examples) {
+      const existing = byRecording.get(incoming.recordingId);
+      if (!existing || existing === incoming || existing.label !== incoming.label || !Array.isArray(incoming.rawMotionData) || !incoming.rawMotionData.length) continue;
+      const saved = await this.getRawMotionData(existing.id);
+      if (Array.isArray(saved) && saved.length) continue;
+      existing.rawMotionData = incoming.rawMotionData;
+      existing.hasRawData = true;
+      // Let the restore flow rebuild summaries from the recovered samples,
+      // rather than retaining metadata left over from an incomplete save.
+      existing.featureVersion = undefined;
+      existing.approachProfile = undefined;
+      repaired++;
+    }
+    return repaired;
   }
 }
 

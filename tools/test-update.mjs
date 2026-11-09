@@ -10,7 +10,10 @@ import assert from 'node:assert/strict';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const currentWorker = await fs.readFile(path.join(root, 'sw.js'), 'utf8');
-const currentRelease = /brixtonvibes-v(\d+)/.exec(currentWorker)?.[1] || '42';
+const currentRelease = /brixtonvibes-v(\d+)/.exec(currentWorker)?.[1];
+const engineSource = await fs.readFile(path.join(root, 'fork-engine.js'), 'utf8');
+const engineVersion = Number(/export const FORK_ENGINE_VERSION\s*=\s*(\d+)/.exec(engineSource)?.[1]);
+assert.ok(currentRelease && Number.isInteger(engineVersion), 'Current release and engine version must be declared');
 const recoveryPage = process.argv[2] || `update.html?release=${currentRelease}`;
 const mount = '/BrixtonVibes/';
 const legacyCommit = '5800ff2';
@@ -133,7 +136,7 @@ try {
   await page.waitForFunction(() => !!document.querySelector('#trackView svg') && !!window.motionLab?.state.sync, null, {timeout:30000});
   check('Explicit update entry replaces cached v38 UI with the real track view', await page.locator('#trackView svg').isVisible());
   check('Migration preserves labelled training metadata and raw samples', await dataStillPresent());
-  check('New precache bypasses still-fresh legacy HTTP cache for unversioned modules', await page.evaluate(async () => (await import('./fork-engine.js')).FORK_ENGINE_VERSION === 6));
+  check('New precache bypasses still-fresh legacy HTTP cache for unversioned modules', await page.evaluate(async expected => (await import('./fork-engine.js')).FORK_ENGINE_VERSION === expected, engineVersion));
   await waitForWorker();
 
   // An idle reload must resolve to the new shell, not the old cache again.

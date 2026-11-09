@@ -59,3 +59,30 @@ test('vibration-only tracking remains explicitly limited when gyro or gravity is
   assert.ok(matcher.value.progress > 0);
   assert.ok(matcher.value.upper - matcher.value.lower >= .3);
 });
+
+const sample = time => ({ time, ax: 1, ay: 0, az: 0,
+  gx: 0, gy: 0, gz: 9.81, rotationAlpha: 0.1, rotationBeta: 0, rotationGamma: 0 });
+
+test('partially missing gravity never fabricates a yaw observation', () => {
+  const frames = motionFrames(Array.from({ length: 120 }, (_, i) => ({ ...sample(i * 20), gx: null })));
+  assert.ok(frames.length > 0);
+  assert.ok(frames.every(f => f.quality && f.features[0] === null && f.features[2] === null));
+});
+
+test('short bursts and interrupted seconds cannot advance the movement clock', () => {
+  const burst = motionFrames(Array.from({ length: 120 }, (_, i) => sample(Math.floor(i / 20) * 1000 + i % 20 * 5)));
+  assert.ok(burst.length > 0);
+  assert.ok(burst.every(f => !f.quality && !f.moving));
+  const frames = [], reader = new MotionFrames(f => frames.push(f));
+  for (let ms = 0; ms < 400; ms += 20) reader.update(sample(ms));
+  for (let ms = 800; ms <= 2000; ms += 20) reader.update(sample(ms));
+  assert.equal(frames[0].gap, true);
+  assert.equal(frames[0].moving, false);
+  assert.equal(frames[1].quality, true);
+});
+
+test('handling samples are counted once when judging the usable fraction', () => {
+  const frames = motionFrames(Array.from({ length: 101 }, (_, i) => ({ ...sample(i * 20), ax: i % 5 === 0 ? 10 : 1 })));
+  assert.ok(frames.length > 0);
+  assert.ok(frames.every(f => f.quality && f.moving));
+});

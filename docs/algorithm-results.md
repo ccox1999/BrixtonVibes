@@ -1,5 +1,7 @@
 # Prediction study — 30 October 2026
 
+The latest cumulative data and engine correctness audit are covered in the [8 November review](november-algorithm-review.md): 46 journeys, 40/46 final development accuracy, and 3/4 new journeys with October-only calibration. This October report is retained as the earlier baseline.
+
 The existing route decision survived the new data. This development retains its yaw-plus-vibration decision and braking hold, improves the meaning of its confidence, and suppresses readings after missing sensors or recording interruptions. It does **not** claim a demonstrated increase in branch accuracy or a verified earlier junction prediction.
 
 The baseline is the v5.1 logic shipped on 28 September in repository commit `5800ff2` (service-worker version 38); its older `FORK_ENGINE_VERSION` constant was still 4. The preserved source is not the earlier v4 decision that the historical notes also describe. This development uses engine version 6.

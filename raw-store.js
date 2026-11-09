@@ -29,7 +29,8 @@ let _dbPromise = null;
 
 function _openDB() {
   if (_dbPromise) return _dbPromise;
-  _dbPromise = new Promise((resolve) => {
+  let settled = false;
+  const opening = new Promise((resolve) => {
     let request;
     try {
       request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -46,19 +47,29 @@ function _openDB() {
     };
     request.onsuccess = () => {
       const db = request.result;
+      if (settled) { db.close(); return; }
+      settled = true;
       // If another tab upgrades the schema, close so it isn't blocked.
-      db.onversionchange = () => db.close();
+      const invalidate = () => { if (_dbPromise === opening) _dbPromise = null; };
+      db.onversionchange = () => { db.close(); invalidate(); };
+      db.onclose = invalidate;
       resolve(db);
     };
     request.onerror = () => {
+      settled = true;
       console.warn("[RawStore] IndexedDB open failed:", request.error);
       resolve(null);
     };
     request.onblocked = () => {
       console.warn("[RawStore] IndexedDB open blocked by another connection");
+      settled = true;
+      resolve(null);
     };
   });
-  return _dbPromise;
+  _dbPromise = opening;
+  // Failed or blocked openings may recover on retry, without a page reload.
+  opening.then(db => { if (!db && _dbPromise === opening) _dbPromise = null; });
+  return opening;
 }
 
 /** Run one operation in a transaction; resolves null/false on any failure. */
@@ -84,7 +95,9 @@ async function _withStore(mode, operation, failValue) {
       return;
     }
     request.onsuccess = () => {
-      result = request.result;
+      // delete()/clear() succeed with an undefined result. Transaction
+      // completion, rather than the result's value, proves a durable write.
+      result = mode === "readwrite" ? true : request.result;
     };
     tx.oncomplete = () => resolve(result);
     tx.onerror = () => {

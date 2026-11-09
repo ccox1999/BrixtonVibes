@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { OneDriveSync, recordingExport, recordingFilename, recordingMetadata } from "./onedrive-sync.js";
+import { OneDriveSync, IndexedDBRecordingStore, recordingExport, recordingFilename, recordingMetadata } from "./onedrive-sync.js";
 import { handleRequest, seal, unseal, validateOwner, checkMutation, verifyMicrosoftIdToken } from "./onedrive-worker/worker.mjs";
 import { SignJWT, generateKeyPair, exportJWK, createLocalJWKSet } from "jose";
 
@@ -24,8 +24,75 @@ test('native-only app mode never requests a backend or authentication service', 
   const sync=client({nativeOnly:true,online:()=>true,fetchImpl:async()=>{calls++;throw new Error('No backend allowed');}});
   await sync.init();sync.setRecording(true);await sync.saveRecording(payload(false));
   await sync.saveRecording(payload(true));sync.setRecording(false);await sync.retry();await sync.refreshStatus();
+  await assert.rejects(sync.connect(), /system share screen/);
+  await assert.rejects(sync.disconnect(), /system share screen/);
   assert.equal(calls,0);assert.equal(sync.getStatus().configured,false);
   assert.equal((await sync.getRecording('trip_1')).complete,true);sync.destroy();
+});
+
+test("journal storage retries a synchronous IndexedDB opening failure", async () => {
+  const previous = globalThis.indexedDB;
+  let calls = 0;
+  const db = { close() {} };
+  globalThis.indexedDB = { open() {
+    if (++calls === 1) throw new Error("temporarily unavailable");
+    const request = { result: db };
+    queueMicrotask(() => request.onsuccess());
+    return request;
+  } };
+  try {
+    const store = new IndexedDBRecordingStore();
+    await assert.rejects(store.open(), /temporarily unavailable/);
+    assert.equal(await store.open(), db);
+    assert.equal(calls, 2);
+  } finally { globalThis.indexedDB = previous; }
+});
+
+test("journal storage closes late connections after a blocked opening", async () => {
+  const previous = globalThis.indexedDB;
+  let request, closed = false;
+  globalThis.indexedDB = { open() { request = { result: { close() { closed = true; } } }; queueMicrotask(() => request.onblocked()); return request; } };
+  try {
+    const store = new IndexedDBRecordingStore();
+    await assert.rejects(store.open(), /other app tab/);
+    request.onsuccess();
+    assert.equal(closed, true);
+    assert.equal(store.db, undefined);
+  } finally { globalThis.indexedDB = previous; }
+});
+
+test("concurrent recording patches preserve both changes and ordered revisions", async () => {
+  const sync = client(); await sync.saveRecording(payload());
+  await Promise.all([
+    sync.updateRecording("trip_1", { label: "right" }),
+    sync.updateRecording("trip_1", { notes: "arrived" })
+  ]);
+  const row = await sync.getRecording("trip_1");
+  assert.equal(row.payload.label, "right");
+  assert.equal(row.payload.notes, "arrived");
+  assert.equal(row.revision, 3);
+  sync.destroy();
+});
+
+test("an HTTP success without explicit upload acknowledgement remains pending", async () => {
+  const sync = client(); await sync.saveRecording(payload());
+  sync.online = () => true; sync.status.authenticated = true;
+  sync.fetch = async () => response({ message: "proxy login" });
+  await sync.retry();
+  assert.equal((await sync.getRecording("trip_1")).uploadedRevision, undefined);
+  assert.equal(sync.getStatus().pending, 1);
+  assert.match(sync.getStatus().message, /not confirmed/);
+  sync.destroy();
+});
+
+test("HTTP-date throttling delays retry for the full server interval", async () => {
+  const now = Date.parse("2026-11-08T20:00:00Z");
+  const sync = client({ now: () => now }); await sync.saveRecording(payload());
+  sync.online = () => true; sync.status.authenticated = true;
+  sync.fetch = async () => response({}, 429, { "Retry-After": new Date(now + 120000).toUTCString() });
+  await sync.retry();
+  assert.equal((await sync.getRecording("trip_1")).nextAttemptAt, now + 120000);
+  sync.destroy();
 });
 
 test("draft persists durably without upload; reload can recover raw samples", async () => {
@@ -187,6 +254,11 @@ test("server encrypts credentials at rest and rejects wrong keys", async () => {
   await assert.rejects(unseal(value, { ...e, TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 8).toString("base64url") }));
 });
 
+test("credential encryption handles payloads beyond JavaScript argument limits", async () => {
+  const e = env(), large = { refresh: "x".repeat(200000) };
+  assert.deepEqual(await unseal(await seal(large, e), e), large);
+});
+
 test("Microsoft identity validation rejects invalid signatures, audience, issuer and expired tokens", async () => {
   const e = env();
   const { privateKey, publicKey } = await generateKeyPair("RS256");
@@ -207,6 +279,8 @@ test("server requires exact owner, tenant and same-origin CSRF protection", asyn
   const e = env();
   assert.equal(validateOwner({ oid: e.ALLOWED_OBJECT_ID, tid: e.ALLOWED_TENANT_ID }, e), true);
   assert.equal(validateOwner({ oid: "other", tid: e.ALLOWED_TENANT_ID }, e), false);
+  assert.equal(validateOwner(null, e), false);
+  assert.equal(validateOwner({ oid: e.ALLOWED_OBJECT_ID, tid: 42 }, e), false);
   assert.equal(checkMutation(request("connect", "POST", { headers: { Origin: "https://evil.example" } }), e), false);
   assert.equal((await handleRequest(request("connect", "POST", { headers: { Origin: "https://evil.example" } }), e)).status, 403);
   assert.equal((await handleRequest(request("recordings/trip_1", "PUT"), e)).status, 401);
@@ -251,6 +325,10 @@ test("server rejects incomplete, mismatched, oversized and invalid recording dat
   assert.equal((await send(recordingExport(payload(false)))).status, 400);
   assert.equal((await send({ version: 3, complete: true, recordingId: "trip_1" })).status, 400);
   assert.equal((await send({ ...recordingExport(payload()), recordingId: "different" })).status, 400);
+  for (const bad of [null, 42, [], { time: "1" }]) {
+    const malformed = recordingExport(payload()); malformed.examples[0].rawMotionData = [bad];
+    assert.equal((await send(malformed)).status, 400);
+  }
   const tooLarge = await handleRequest(request("recordings/trip_1", "PUT", { headers: { Cookie: sessionCookie, "Content-Type": "application/json", "Content-Length": String(13 * 1024 * 1024) }, body: "{}" }), e);
   assert.equal(tooLarge.status, 413);
 });

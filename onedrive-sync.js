@@ -23,7 +23,8 @@ export class IndexedDBRecordingStore {
   async open() {
     if (this.db) return this.db;
     if (this.opening) return this.opening;
-    this.opening = new Promise((resolve, reject) => {
+    let settled = false;
+    const opening = new Promise((resolve, reject) => {
       let req;
       try { req = indexedDB.open(DB_NAME, 2); } catch (e) { reject(e); return; }
       req.onupgradeneeded = () => {
@@ -41,14 +42,20 @@ export class IndexedDBRecordingStore {
         }
       };
       req.onsuccess = () => {
+        // An opening rejected as blocked can still succeed after another tab
+        // closes. Do not retain that unobserved connection.
+        if (settled) { req.result.close(); return; }
+        settled = true;
         this.db = req.result;
         this.db.onversionchange = () => { this.db.close(); this.db = null; this.opening = null; };
         resolve(this.db);
       };
-      req.onerror = () => { this.opening = null; reject(req.error || new Error("Recording storage unavailable")); };
-      req.onblocked = () => { this.opening = null; reject(new Error("Close the other app tab to save recordings")); };
+      req.onerror = () => { settled = true; reject(req.error || new Error("Recording storage unavailable")); };
+      req.onblocked = () => { settled = true; reject(new Error("Close the other app tab to save recordings")); };
     });
-    return this.opening;
+    this.opening = opening;
+    opening.catch(() => { if (this.opening === opening) this.opening = null; });
+    return opening;
   }
   async transaction(mode, operation, storeName = STORE) {
     const db = await this.open();
@@ -143,24 +150,36 @@ export class OneDriveSync {
     if (!Array.isArray(payload.rawMotionData) || !payload.rawMotionData.length) throw new Error("No sensor samples to save");
     const snapshot = clone(payload);
     // Serialize local revisions so Finish cannot race a preceding autosave.
-    const work = this.saveChain.then(async () => {
-      const old = await this.store.getMetadata(id);
-      const row = { ...old, id, payload: snapshot, complete: snapshot.complete !== false, revision: (old?.revision || 0) + 1, createdAt: old?.createdAt || this.now(), updatedAt: this.now(), attempts: 0, nextAttemptAt: 0, lastError: null };
-      await this.store.put(row); // transaction completed BEFORE any network work
-      await this.counts();
-      this.emit({ state: "saved", message: row.complete ? "Saved on this phone" : "Recording protected on this phone" });
-      return { id, durable: true, revision: row.revision, complete: row.complete };
-    });
+    const work = this.saveChain.then(() => this.persistSnapshot(id, snapshot));
     this.saveChain = work.catch(() => {});
     const result = await work;
     if (result.complete && !this.recording) this.retry().catch(() => {});
     return result;
   }
   async updateRecording(id, patch) {
-    await this.saveChain;
-    const row = await this.store.get(id);
-    if (!row) throw new Error("Recording not found on this phone");
-    return this.saveRecording({ ...row.payload, ...patch, recordingId: id });
+    recordingFilename(id);
+    const snapshot = clone(patch);
+    // Queue the READ as well as the write: simultaneous patches otherwise
+    // both read the old payload and the last patch erases the first one.
+    const work = this.saveChain.then(async () => {
+      const row = await this.store.get(id);
+      if (!row) throw new Error("Recording not found on this phone");
+      const next = { ...row.payload, ...snapshot, recordingId: id };
+      if (!Array.isArray(next.rawMotionData) || !next.rawMotionData.length) throw new Error("No sensor samples to save");
+      return this.persistSnapshot(id, next);
+    });
+    this.saveChain = work.catch(() => {});
+    const result = await work;
+    if (result.complete && !this.recording) this.retry().catch(() => {});
+    return result;
+  }
+  async persistSnapshot(id, snapshot) {
+    const old = await this.store.getMetadata(id);
+    const row = { ...old, id, payload: snapshot, complete: snapshot.complete !== false, revision: (old?.revision || 0) + 1, createdAt: old?.createdAt ?? this.now(), updatedAt: this.now(), attempts: 0, nextAttemptAt: 0, lastError: null };
+    await this.store.put(row); // transaction completed BEFORE any network work
+    await this.counts();
+    this.emit({ state: "saved", message: row.complete ? "Saved on this phone" : "Recording protected on this phone" });
+    return { id, durable: true, revision: row.revision, complete: row.complete };
   }
   async getRecording(id) { await this.saveChain; return this.store.get(id); }
   async listRecordings() {
@@ -173,6 +192,7 @@ export class OneDriveSync {
     return { blob: new Blob([JSON.stringify(recordingExport(row.payload))], { type: "application/json" }), filename: recordingFilename(id) };
   }
   async connect() {
+    if (this.nativeOnly) throw new Error("Use Save to OneDrive in the system share screen");
     if (this.recording) throw new Error("Finish recording before connecting OneDrive");
     const res = await this.request(`${API}/connect`, { method: "POST", credentials: "same-origin", headers: { "X-BrixtonVibes": "1" } });
     if (!res.ok) throw new Error("OneDrive setup is required; see the setup guide");
@@ -181,6 +201,7 @@ export class OneDriveSync {
     globalThis.location.assign(url);
   }
   async disconnect() {
+    if (this.nativeOnly) throw new Error("OneDrive connections are managed in the system share screen");
     if (this.recording) throw new Error("Finish recording before changing OneDrive");
     const res = await this.request(`${API}/disconnect`, { method: "POST", credentials: "same-origin", headers: { "X-BrixtonVibes": "1" } });
     if (!res.ok) throw new Error("Could not disconnect OneDrive; try again when online");
@@ -210,10 +231,15 @@ export class OneDriveSync {
           if (!res.ok) {
             const failure = new Error(res.status === 401 ? "Reconnect OneDrive after recording; your file is safe" : `Upload paused (${res.status}); your file is safe`);
             failure.status = res.status;
-            const retryAfter = Number(res.headers.get("retry-after"));
-            failure.retryAfter = Number.isFinite(retryAfter) ? retryAfter * 1000 : 0;
+            const header = res.headers.get("retry-after");
+            const retryAfter = header === null ? NaN : Number(header);
+            failure.retryAfter = Number.isFinite(retryAfter) ? Math.max(0, retryAfter * 1000) : Math.max(0, (Date.parse(header) || 0) - this.now());
             throw failure;
           }
+          // A proxy can return a 200 HTML page. Only the API's explicit
+          // acknowledgement confirms that a recording reached OneDrive.
+          const acknowledgement = await res.json();
+          if (acknowledgement?.uploaded !== true || (acknowledgement.filename && acknowledgement.filename !== recordingFilename(row.id))) throw new Error("Upload was not confirmed; your file is safe on this phone");
           // A label may have been saved during the upload; never mark that
           // NEWER revision uploaded until its own request has succeeded.
           await this.markRow(row.id, latest => ({ ...latest, uploadedRevision: row.revision, lastError: null, attempts: 0, nextAttemptAt: 0, uploadedAt: this.now() }));

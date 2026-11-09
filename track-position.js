@@ -19,24 +19,29 @@ export class MotionFrames {
     this.start = null; this.previous = null; this.bucket = -1;
     this.count = 0; this.square = 0; this.yaws = []; this.vertical = 0;
     this.valid = 0; this.rejected = 0; this.rmsHistory = []; this.elapsed = 0;
+    this.firstInBucket = null; this.lastInBucket = null; this.interrupted = false;
   }
   update(s) {
     if (!s || !finite(s.time)) return;
     if (this.previous !== null && s.time <= this.previous) return;
     if (this.start === null) this.start = s.time;
     const bucket = Math.floor((s.time - this.start) / 1000);
+    const interrupted = this.previous !== null && s.time - this.previous > 250;
     if (this.bucket !== -1 && bucket !== this.bucket) {
-      this.flush(s.time, bucket - this.bucket > 1);
+      this.flush(s.time, bucket - this.bucket > 1 || interrupted);
     }
     this.bucket = bucket; this.previous = s.time;
+    this.firstInBucket ??= s.time;
+    this.lastInBucket = s.time;
+    this.interrupted ||= interrupted;
+    this.count++;
     if (![s.ax, s.ay, s.az].every(finite)) { this.rejected++; return; }
     const mag = Math.hypot(s.ax, s.ay, s.az);
     const g = Math.hypot(s.gx, s.gy, s.gz);
     const rotation = Math.hypot(s.rotationAlpha || 0, s.rotationBeta || 0, s.rotationGamma || 0);
-    this.count++;
     if (mag > 6 || rotation > 25) { this.rejected++; return; }
     this.valid++; this.square += mag * mag;
-    if (finite(g) && g > 5 && g < 15 &&
+    if ([s.gx, s.gy, s.gz].every(finite) && g > 5 && g < 15 &&
         [s.rotationAlpha, s.rotationBeta, s.rotationGamma].every(finite)) {
       this.yaws.push(clamp(-(s.rotationBeta * s.gx + s.rotationGamma * s.gy + s.rotationAlpha * s.gz) / g, -12, 12));
       this.vertical += Math.abs((s.ax * s.gx + s.ay * s.gy + s.az * s.gz) / g);
@@ -44,7 +49,9 @@ export class MotionFrames {
   }
   flush(t, gap = false) {
     const rms = Math.sqrt(this.square / Math.max(1, this.valid));
-    const quality = this.valid >= 10 && this.valid / Math.max(1, this.count + this.rejected) > 0.75 && !gap;
+    gap ||= this.interrupted;
+    const covered = this.lastInBucket - this.firstInBucket >= 750;
+    const quality = this.valid >= 10 && covered && this.valid / Math.max(1, this.count) > 0.75 && !gap;
     // Dwell samples must not drag the cruise reference down: otherwise a
     // 30-second wait changes which future samples count as movement. Keep a
     // reservoir of plausible movement, rather than elapsed recording seconds.
@@ -55,13 +62,16 @@ export class MotionFrames {
     // 'cruise'. The relative threshold follows the established engine's clock.
     const moving = quality && rms >= Math.max(0.18, cruise * 0.6);
     const yawValid = this.yaws.length >= Math.max(8, this.valid * 0.7);
-    const frame = { t, seconds: 1, moving, quality, gap, rms,
+    const frame = { t, startTime: this.start + this.bucket * 1000,
+      endTime: this.start + (this.bucket + 1) * 1000,
+      seconds: 1, moving, quality, gap, rms,
       yaw: yawValid ? quantile(this.yaws, 0.5) : null,
       features: [yawValid ? quantile(this.yaws, 0.5) : null,
         Math.log(Math.max(0.02, rms) / cruise),
         yawValid ? this.vertical / this.yaws.length / Math.max(rms, 0.05) : null] };
     this.onFrame(frame);
     this.count = 0; this.valid = 0; this.square = 0; this.yaws = []; this.vertical = 0; this.rejected = 0;
+    this.firstInBucket = null; this.lastInBucket = null; this.interrupted = false;
   }
 }
 

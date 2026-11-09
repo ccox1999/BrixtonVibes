@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ForkEngine, yawIntegral, magSkew, liveReadingAt, replayDisplay } from '../fork-engine.js';
+import { ForkEngine, yawIntegral, magSkew, liveReadingAt, replayDisplay, shownAt, calibrate } from '../fork-engine.js';
 import { loadRecordings } from '../lib/recordings.mjs';
 
 const cal={liveYaw:{sign:1,thr:0,sd:1},liveSkew:{sign:-1,thr:1,sd:1},
@@ -46,6 +46,62 @@ test('non-increasing timestamps never advance the engine',()=>{
   assert.equal(e.update(s,[s]),null);assert.equal(e.vib.length,1);
 });
 
+test('invalid stale events cannot rewind the engine clock or withdraw newer evidence',()=>{
+  const e=new ForkEngine(cal),raw=samples(10);
+  e.update(raw[9],raw);
+  const previous=e.lastSampleTime;
+  assert.equal(e.update({...raw[0],rotationAlpha:null},raw),null);
+  assert.equal(e.lastSampleTime,previous);
+  assert.equal(e.invalidUntil,-Infinity);
+  assert.equal(e.vib.length,1);
+});
+
+test('duplicate and backward samples do not change trailing yaw or skew',()=>{
+  const raw=samples(2000),withStale=[];
+  for(let i=0;i<raw.length;i++) {
+    withStale.push(raw[i]);
+    if(i>0 && i%25===0) withStale.push({...raw[i],rotationAlpha:100,ax:100}, {...raw[i-1],rotationAlpha:-100,ax:100});
+  }
+  assert.equal(yawIntegral(withStale,39980,16,0),yawIntegral(raw,39980,16,0));
+  assert.equal(magSkew(withStale,39980,14,0),magSkew(raw,39980,14,0));
+});
+
+test('braking during interruption recovery cannot latch contaminated pre-gap evidence',()=>{
+  const raw=samples().map(s=>s.time>=80000?{...s,ax:s.ax*.001,ay:s.ay*.001,az:s.az*.001}:s);
+  raw[4000]={...raw[4000],rotationAlpha:null};
+  const e=new ForkEngine(cal);let v;
+  for(const s of raw) {
+    v=e.update(s,raw,true);
+    if(s.time>=80000 && s.time<96000) {
+      assert.equal(v.phase,'cleared');
+      assert.equal(e.frozen,false);
+    }
+  }
+  assert.equal(v.phase,'firm');
+  assert.ok(e.readAt>=96000,'the held window must begin after a full clean recovery');
+  assert.ok(Number.isFinite(v.score));
+});
+
+test('direct readings reject broken and incomplete windows rather than treating them as zero motion',()=>{
+  const raw=samples(2000),broken=raw.map(s=>s.time===35000?{...s,rotationGamma:null}:s);
+  assert.equal(liveReadingAt(broken,39980,cal),null);
+  assert.equal(liveReadingAt(raw.filter(s=>s.time<20000 || s.time>24000),39980,cal),null);
+  assert.equal(liveReadingAt(samples(600),11980,cal),null);
+  assert.equal(liveReadingAt(raw,39980,null),null);
+});
+
+test('short recordings cannot fit partial arrival windows as complete training journeys',()=>{
+  const raw=samples(600);
+  const examples=Array.from({length:8},(_,i)=>({label:i<4?'left':'right',rawMotionData:raw}));
+  const fitted=calibrate(examples);
+  assert.equal(fitted.n,0);assert.equal(fitted.liveYaw,undefined);
+});
+
+test('empty recordings and timelines produce no retrospective answer',()=>{
+  assert.deepEqual(replayDisplay([],cal),[]);
+  assert.equal(shownAt([],0),null);
+});
+
 test('untrained installations cannot invent a confident probability',()=>{
   const e=new ForkEngine(),raw=samples();let v;
   for(const s of raw)v=e.update(s,raw,s.time===raw.at(-1).time)||v;
@@ -85,6 +141,33 @@ test('cumulative exports deduplicate raw journeys and reject conflicting labels'
   } finally {
     assert.equal(path.dirname(fs.realpathSync(dir)),fs.realpathSync(os.tmpdir()));
     assert.ok(path.basename(dir).startsWith('brixton-recordings-'));
+    fs.rmSync(dir,{recursive:true,force:true});
+  }
+});
+
+test('recording loader rejects malformed exports and sample times while preserving missing sensor values',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'brixton-recording-validation-'));
+  try {
+    const file=path.join(dir,'recordings.json');
+    const failures=[
+      null,{examples:null},{examples:{}},{examples:[null]},{examples:[1]},{examples:[[]]},
+      {examples:[{rawMotionData:'invalid'}]},
+      ...[null,1,[],{time:null},{time:'1'},{}].map(sample=>({examples:[{rawMotionData:[sample]}]})),
+      {examples:[{label:'left',timestamp:null,rawMotionData:samples(600)}]},
+    ];
+    for(const input of failures) {
+      fs.writeFileSync(file,JSON.stringify(input));
+      assert.throws(()=>loadRecordings([file]),/Invalid recording/);
+    }
+    const raw=samples(600).map(s=>({...s,rotationAlpha:null,gz:null}));
+    fs.writeFileSync(file,JSON.stringify({examples:[{id:'missing-sensors',label:'left',timestamp:1,rawMotionData:raw}]}));
+    const loaded=loadRecordings([file]);
+    assert.equal(loaded.examples.length,1);
+    assert.equal(loaded.examples[0].rawMotionData[0].rotationAlpha,null);
+    assert.equal(loaded.examples[0].rawMotionData[0].gz,null);
+  } finally {
+    assert.equal(path.dirname(fs.realpathSync(dir)),fs.realpathSync(os.tmpdir()));
+    assert.ok(path.basename(dir).startsWith('brixton-recording-validation-'));
     fs.rmSync(dir,{recursive:true,force:true});
   }
 });

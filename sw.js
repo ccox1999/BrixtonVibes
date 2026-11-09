@@ -1,14 +1,14 @@
 /* One coherent offline app release. Never deletes recording databases or
  * localStorage. Boot/recovery code installs a release before loading the app. */
 "use strict";
-const CACHE_VERSION = "brixtonvibes-v42";
+const CACHE_VERSION = "brixtonvibes-v43";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./style.css",
-  "./style.css?v=42",
-  "./app-bootstrap.js?v=42",
-  "./app.js?v=42",
+  "./style.css?v=43",
+  "./app-bootstrap.js?v=43",
+  "./app.js?v=43",
   "./features.js",
   "./classifier.js",
   "./training-set.js",

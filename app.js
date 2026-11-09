@@ -56,6 +56,7 @@ async function loadMLModules() {
   const TRIM_CHUNK = 2000;         // trim this many at once (amortised, not per-event)
   const STATS_UPDATE_MS = 150;     // throttle for the text counters
   const SENSOR_WATCHDOG_MS = 2500; // "no data arriving" warning delay
+  const COMPASS_MAX_AGE_MS = 1000; // never repeat a stalled compass as fresh evidence
   const GRAVITY = 9.81;            // m/s² per g
   // Normal samples arrive ~16–20 ms apart. A gap far larger than that means
   // the OS stopped delivering samples (e.g. iOS parks the main thread during
@@ -174,9 +175,13 @@ async function loadMLModules() {
     // it yet. null until the first reading (or if the device has none).
     heading: null,
     headingAccuracy: null,
+    lastOrientationAt: null,
 
     // ML state (Phase 1 & 2)
     trainSet: null,           // TrainingSet instance (loaded on init)
+    trainSetLoading: null,
+    calibrationRequest: 0,
+    calibrationDeferred: false,
     classifier: null,         // cached KNNClassifier (Phase 2 live predictions)
     classifierBuiltFor: -1,   // trainSet.count() the cached classifier was built from
     lastPredictionAt: 0,      // timestamp of last live prediction (Phase 2)
@@ -195,6 +200,7 @@ async function loadMLModules() {
     trackView: null,
     position: null,
     wakeLock: null,
+    wakeLockPending: false,
     lastSampleReceivedAt: null,
     predictionPending: false,
     finishing: false,
@@ -302,23 +308,22 @@ async function loadMLModules() {
    * Get the (lazily created) training set, loading any persisted examples.
    */
   async function ensureTrainSet() {
-    if (!state.trainSet) {
+    if (state.trainSetLoading) return state.trainSetLoading;
+    if (state.trainSet) return state.trainSet;
+    state.trainSetLoading = (async () => {
       const ml = await loadMLModules();
       // Best-effort: ask the browser not to evict IndexedDB (raw recordings)
       // under storage pressure. No-op where unsupported.
       ml.rawStore.requestPersistence();
-      state.trainSet = new ml.trainingSet.TrainingSet();
-      await state.trainSet.load();
-      // Derive the fork engine's device-specific sign/threshold once at
-      // startup, off the recording hot path. Fire-and-forget.
-      refreshForkCalibration();
+      const trainSet = new ml.trainingSet.TrainingSet();
+      await trainSet.load();
       // Bring any examples saved by an older feature extractor up to the
       // current definition (fork-localised windows + approach shape),
       // re-extracting from their stored raw motion data so the whole set is
       // on one consistent scale — and backfill missing approach profiles.
       // recordingComplete=true: every stored example is, by definition, a
       // finished recording (see extractForkFeatures' tier 4).
-      const changed = await state.trainSet.reprocessFeatures(
+      const changed = await trainSet.reprocessFeatures(
         (raw, hz) => ml.features.extractForkFeatures(raw, hz, undefined, true),
         ml.features.FEATURE_VERSION,
         60,
@@ -327,8 +332,14 @@ async function loadMLModules() {
       if (changed > 0) {
         console.log(`[ML] Reprocessed ${changed} example(s) to feature v${ml.features.FEATURE_VERSION}`);
       }
-    }
-    return state.trainSet;
+      // Publish only the fully loaded set: another caller must not save an
+      // empty, partially loaded instance over the existing phone history.
+      state.trainSet = trainSet;
+      refreshForkCalibration();
+      return trainSet;
+    })();
+    try { return await state.trainSetLoading; }
+    finally { state.trainSetLoading = null; }
   }
 
   /**
@@ -538,16 +549,23 @@ async function loadMLModules() {
 
     // Wire up delete buttons
     ui.recordingsList.querySelectorAll(".recording-delete").forEach(btn => {
-      btn.addEventListener("click", (e) => {
+      btn.addEventListener("click", async (e) => {
         // currentTarget, not target: a click can land on a child node of the
         // button, which has no data-id.
         const id = e.currentTarget.dataset.id;
         if (window.confirm("Delete this recording?")) {
           state.trainSet.remove(id);
-          state.trainSet.save().then(() => {
-            updateTrainingStatus();
-            refreshForkCalibration();
-          });
+          try {
+            await state.trainSet.save();
+            await updateTrainingStatus();
+            await refreshForkCalibration();
+          } catch (error) {
+            // A failed metadata write leaves the saved journey intact. Reload
+            // that copy so the on-screen list and calibration agree with it.
+            await state.trainSet.load();
+            await updateTrainingStatus();
+            ui.saveStatus.textContent = `Could not delete the journey: ${error.message}. Saved recording retained.`;
+          }
         }
       });
     });
@@ -578,24 +596,33 @@ async function loadMLModules() {
    * every raw recording out of IndexedDB. Falls back to shipped defaults.
    */
   async function refreshForkCalibration(trips) {
-    if (state.recording) return;
-    state.forkCal = null;
+    if (state.recording) { state.calibrationDeferred = true; return; }
+    const request = ++state.calibrationRequest;
+    let nextCalibration = null, nextReference = null;
     try {
       if (!state.trainSet || state.trainSet.count() < 6) return;
       const ml = await loadMLModules();
       const examples = trips || (await loadLabelledTrips());
       if (examples.length < 6) return;
+      if (state.recording || request !== state.calibrationRequest) return;
       const cal = ml.forkEngine.calibrate(examples);
-      if (!state.recording) state.trackReference = ml.position.buildTrackReference(examples) || state.trackReference;
+      nextReference = ml.position.buildTrackReference(examples);
       // Only adopt a calibration that actually separates the classes; a
       // degenerate one would be worse than the shipped defaults.
       if (cal && cal.separation > 0.5) {
-        state.forkCal = cal;
+        nextCalibration = cal;
         console.info("[fork] calibrated from", cal.n, "trips; sign", cal.sign,
                      "separation", cal.separation.toFixed(2));
       }
     } catch (err) {
       console.warn("[fork] calibration skipped:", err);
+    } finally {
+      // Raw-data reads can finish after Start was tapped or after a newer
+      // restore/delete. Keep each live journey on one calibration.
+      if (!state.recording && request === state.calibrationRequest) {
+        state.forkCal = nextCalibration;
+        if (nextReference) state.trackReference = nextReference;
+      } else if (state.recording && request === state.calibrationRequest) state.calibrationDeferred = true;
     }
   }
 
@@ -623,8 +650,8 @@ async function loadMLModules() {
       const ml = await loadMLModules();
 
       // ---- Fork engine (primary): a physics-derived rule, not a search.
-      // Unlike the kNN path it needs no training examples to produce an
-      // answer, so it also works on a fresh install. See fork-engine.js.
+      // Real labelled history calibrates the confidence; a fresh install
+      // remains at 50% until enough evidence exists. See fork-engine.js.
       if (!state.forkEngine) {
         // state.forkCal is computed off the hot path by refreshForkCalibration()
         // (raw data lives in IndexedDB; pulling it mid-recording would stall
@@ -700,10 +727,20 @@ async function loadMLModules() {
 
       // Insufficient route evidence stays undecided; the retired classifier must
       // not turn missing sensor data into an apparently confident fallback.
+      state.lastLivePrediction = null;
       clearForecastPodium();
+      setForecastStyle('provisional');
+      renderPosition();
       ui.forecastNote.textContent = 'No usable route evidence yet';
     } catch (err) {
       console.warn("[ML] Live prediction failed:", err);
+      if (state.recording) {
+        state.lastLivePrediction = null;
+        clearForecastPodium();
+        setForecastStyle('provisional');
+        renderPosition();
+        ui.forecastNote.textContent = 'Sensor reading unavailable — waiting for clean evidence';
+      }
     } finally { state.predictionPending = false; }
   }
 
@@ -744,15 +781,20 @@ async function loadMLModules() {
    */
   async function showLabelingDialog() {
     return new Promise((resolve) => {
+      const previousFocus = document.activeElement;
       const modal = document.createElement("div");
       modal.className = "modal-overlay";
 
       const content = document.createElement("div");
       content.className = "modal-content";
+      content.setAttribute('role', 'dialog');
+      content.setAttribute('aria-modal', 'true');
+      content.setAttribute('aria-labelledby', 'tripLabelTitle');
+      content.setAttribute('aria-describedby', 'tripLabelPrompt');
 
       content.innerHTML = `
-        <h2 class="modal-title">Label This Trip</h2>
-        <p class="modal-subtitle">Which platform did you arrive at?</p>
+        <h2 class="modal-title" id="tripLabelTitle">Label This Trip</h2>
+        <p class="modal-subtitle" id="tripLabelPrompt">Which platform did you arrive at?</p>
         <div class="modal-buttons">
           <button class="btn btn-primary modal-btn" data-answer="left">← LEFT</button>
           <button class="btn btn-primary modal-btn" data-answer="right">RIGHT →</button>
@@ -762,20 +804,41 @@ async function loadMLModules() {
 
       modal.appendChild(content);
       document.body.appendChild(modal);
+      const shell = document.querySelector('.app-shell');
+      const wasInert = shell.inert;
+      shell.inert = true;
+      const finish = answer => {
+        document.removeEventListener('keydown', onKeyDown);
+        shell.inert = wasInert;
+        modal.remove();
+        if (previousFocus?.isConnected && !previousFocus.disabled) previousFocus.focus();
+        resolve(answer);
+      };
+      const buttons = [...content.querySelectorAll('button')];
+      const onKeyDown = event => {
+        if (event.key === 'Escape') { event.preventDefault(); finish('skip'); }
+        else if (event.key === 'Tab') {
+          const index = buttons.indexOf(document.activeElement);
+          if (index < 0 || (!event.shiftKey && index === buttons.length - 1) || (event.shiftKey && index === 0)) {
+            event.preventDefault();
+            buttons[event.shiftKey ? buttons.length - 1 : 0].focus();
+          }
+        }
+      };
+      document.addEventListener('keydown', onKeyDown);
+      content.querySelector('[data-answer="skip"]').focus();
 
       content.querySelectorAll("button").forEach((btn) => {
         btn.addEventListener("click", () => {
           const answer = btn.dataset.answer;
-          modal.remove();
-          resolve(answer);
+          finish(answer);
         });
       });
 
       // Close on background tap
       modal.addEventListener("click", (e) => {
         if (e.target === modal) {
-          modal.remove();
-          resolve("skip");
+          finish("skip");
         }
       });
     });
@@ -896,16 +959,24 @@ async function loadMLModules() {
       ui.sensorWarning.textContent = '';
       return;
     }
+    if (!state.data.length || !state.recordingId) {
+      ui.saveStatus.textContent = 'Local recording storage is unavailable. Device saves may fail; keep this page open.';
+      return;
+    }
     const old = document.getElementById('emergencyDownload');
     if (!old) {
       const button = document.createElement('button');
       button.id = 'emergencyDownload'; button.className = 'btn';
-      button.textContent = 'Save unsaved recording to OneDrive';
       const payload=recordingPayload(true);
       const portable=mlModules?.cloud.recordingExport(payload) || {version:3,examples:[{...payload,id:payload.recordingId,features:{},hasRawData:true}]};
-      state.nativeSave?.prepare(new Blob([JSON.stringify(portable)],{type:'application/json'}),`victoria-recording-${state.recordingId}.json`);
-      button.disabled=!state.nativeSave?.supported();
-      button.addEventListener('click', () => state.nativeSave?.share().catch(showCloudError));
+      const blob = new Blob([JSON.stringify(portable)],{type:'application/json'});
+      const filename = `victoria-recording-${state.recordingId}.json`;
+      state.nativeSave?.prepare(blob,filename);
+      const canShare = state.nativeSave?.supported();
+      button.textContent = canShare ? 'Save unsaved recording to OneDrive' : 'Download unsaved recording';
+      button.addEventListener('click', () => canShare
+        ? state.nativeSave.share().catch(showCloudError)
+        : downloadBlob(blob,filename));
       ui.saveStatus.after(button);
     }
     if (!document.getElementById('retryLocalSave')) {
@@ -918,6 +989,9 @@ async function loadMLModules() {
 
   function showCloudError(error) {
     ui.cloudStatus.textContent = `OneDrive: ${error?.message || error}. Local recordings retained.`;
+    if (!state.recording) ui.saveStatus.textContent = state.memoryUnsaved
+      ? `Device save still needs retry. ${error?.message || error}. Keep this page open.`
+      : `OneDrive save unavailable: ${error?.message || error}. Recording retained.`;
   }
 
   function recordingPayload(complete) {
@@ -958,6 +1032,9 @@ async function loadMLModules() {
 
   async function prepareNativeRecording(id) {
     if (!state.sync || !state.nativeSave || state.recording) return;
+    if (state.memoryUnsaved) {
+      throw new Error('Retry saving the current recording before selecting an older trip');
+    }
     const request=++state.nativePreparation;
     ui.saveOneDriveBtn.disabled=true;
     const file=await state.sync.downloadRecording(id);
@@ -985,12 +1062,14 @@ async function loadMLModules() {
     const container=document.getElementById('localRecordings');
     const rows=await state.sync.listRecordings();
     container.replaceChildren();
-    for (const row of rows.slice(0,30)) {
+    for (const row of rows) {
       const div=document.createElement('div'); div.className='local-recording';
       const text=document.createElement('span');
       text.textContent=`${new Date(row.createdAt).toLocaleDateString()} · ${row.complete ? 'Saved trip' : 'Recovered unfinished trip'}`;
-      const button=document.createElement('button'); button.className='btn'; button.textContent='Select for OneDrive';
-      button.addEventListener('click',async()=>{try{await prepareNativeRecording(row.id);ui.saveOneDriveBtn.scrollIntoView({behavior:'smooth',block:'center'});ui.saveOneDriveBtn.focus();}catch(error){showCloudError(error);}});
+      const button=document.createElement('button'); button.className='btn';
+      button.textContent=row.id===state.nativeRecordId?'Selected for OneDrive':'Select for OneDrive';
+      button.setAttribute('aria-pressed',String(row.id===state.nativeRecordId));
+      button.addEventListener('click',async()=>{try{await prepareNativeRecording(row.id);await renderLocalRecordings();ui.saveOneDriveBtn.scrollIntoView({behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth',block:'center'});ui.saveOneDriveBtn.focus();}catch(error){showCloudError(error);}});
       div.append(text,button); container.appendChild(div);
       if (!row.complete) {
         const finish=document.createElement('button'); finish.className='btn'; finish.textContent='Keep trip';
@@ -1007,15 +1086,26 @@ async function loadMLModules() {
       ui.trackProgress.textContent='Learning the movement';
       ui.trackUncertainty.textContent='No position fix yet';
     } else {
-      ui.trackProgress.textContent=`Relative progress ≈ ${Math.round(p.progress*20)*5}%`;
+      // The estimator deliberately stops short of arrival. Rounding its .98
+      // cap upward must not turn an uncertain movement match into "100%".
+      ui.trackProgress.textContent=`Relative progress ≈ ${Math.min(95,Math.round(p.progress*20)*5)}%`;
       ui.trackUncertainty.textContent=`Range ${Math.floor(p.lower*20)*5}–${Math.ceil(p.upper*20)*5}%`;
     }
     ui.trackMotion.textContent=p?.quality==='limited-sensors'?'Sensors limited':p?.moving?'Moving':state.recording?'Stopped / slow':'Ready';
   }
 
   async function requestWakeLock() {
-    try { if (navigator.wakeLock && !document.hidden) state.wakeLock = await navigator.wakeLock.request('screen'); }
+    if (!state.recording || document.hidden || state.wakeLockPending || (state.wakeLock && !state.wakeLock.released)) return;
+    state.wakeLockPending = true;
+    try {
+      if (navigator.wakeLock) {
+        const lock = await navigator.wakeLock.request('screen');
+        if (state.recording && !document.hidden) state.wakeLock = lock;
+        else await lock.release();
+      }
+    }
     catch { /* Optional iOS capability; visibility warning remains truthful. */ }
+    finally { state.wakeLockPending = false; }
   }
 
   async function initJourneyTools() {
@@ -1406,6 +1496,7 @@ async function loadMLModules() {
     const acc = event.acceleration;
     const rot = event.rotationRate; // iOS reports °/s (per spec)
     const aig = event.accelerationIncludingGravity;
+    const freshCompass = state.lastOrientationAt !== null && performance.now() - state.lastOrientationAt <= COMPASS_MAX_AGE_MS;
 
     // Reading time (not handler-run time) — see motionTime(). Guard monotonic
     // so the buffer stays sorted for the binary-search window lookups.
@@ -1432,8 +1523,8 @@ async function loadMLModules() {
       gz: Number.isFinite(aig?.z) && Number.isFinite(acc?.z) ? aig.z - acc.z : null,
       // Latest compass reading (see handleOrientation), rounded: compass
       // accuracy is whole degrees at best, so more digits only bloat backups.
-      heading: state.heading === null ? null : Math.round(state.heading * 100) / 100,
-      headingAccuracy: state.headingAccuracy === null ? null : Math.round(state.headingAccuracy * 10) / 10,
+      heading: !freshCompass || state.heading === null ? null : Math.round(state.heading * 100) / 100,
+      headingAccuracy: !freshCompass || state.headingAccuracy === null ? null : Math.round(state.headingAccuracy * 10) / 10,
     });
 
     // First sample arrived — cancel the "no data" watchdog.
@@ -1467,8 +1558,11 @@ async function loadMLModules() {
     } else if (event.absolute && typeof event.alpha === "number" && Number.isFinite(event.alpha)) {
       heading = (360 - event.alpha) % 360;
     }
-    if (heading === null) return;
-    state.heading = heading;
+    // An unavailable absolute reading invalidates the previous one. Relative
+    // orientation events from another source do not overwrite a valid compass.
+    if (heading === null && !event.absolute && !('webkitCompassHeading' in event)) return;
+    state.heading = heading === null ? null : ((heading % 360) + 360) % 360;
+    state.lastOrientationAt = heading === null ? null : performance.now();
     state.headingAccuracy =
       typeof event.webkitCompassAccuracy === "number" && Number.isFinite(event.webkitCompassAccuracy)
         ? event.webkitCompassAccuracy
@@ -1492,13 +1586,12 @@ async function loadMLModules() {
         // the other. Motion decides whether recording can go ahead; the
         // compass is optional — without it, recorded headings are just null.
         const motionAsk = DeviceMotionEvent.requestPermission();
-        const orientationAsk =
-          typeof DeviceOrientationEvent !== "undefined" &&
-          typeof DeviceOrientationEvent.requestPermission === "function"
-            ? DeviceOrientationEvent.requestPermission().catch(() => "denied")
-            : Promise.resolve("n/a");
+        try {
+          if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+            Promise.resolve(DeviceOrientationEvent.requestPermission()).catch(() => {});
+          }
+        } catch { /* Optional compass permission cannot prevent motion recording. */ }
         const response = await motionAsk;
-        await orientationAsk;
         if (response !== "granted") {
           setPill("denied", "Permission denied");
           // iOS remembers the denial — explain how to get re-prompted.
@@ -1545,7 +1638,6 @@ async function loadMLModules() {
     ui.saveOneDriveHelp.classList.add('hidden');
     clearInterval(state.journalTimer);
     state.journalTimer = setInterval(() => protectRecording(false), 5000);
-    requestWakeLock();
     ui.recordLabel.textContent = 'Finish recording';
     ui.saveStatus.textContent = 'Recording · local recovery copy every 5 seconds';
     ui.sensorWarning.textContent = '';
@@ -1560,6 +1652,7 @@ async function loadMLModules() {
     // wall-clock times in saved rawMotionData.
     state.epochBase = Date.now() - performance.now();
     state.recording = true;
+    requestWakeLock();
     state.motionTsOffset = null; // re-estimate the sensor-clock offset per trip
     state.lastPredictionAt = 0;
     state.lastLivePrediction = null;
@@ -1580,6 +1673,7 @@ async function loadMLModules() {
     // browsers on deviceorientationabsolute; listening to both is harmless.
     state.heading = null;
     state.headingAccuracy = null;
+    state.lastOrientationAt = null;
     window.addEventListener("deviceorientation", handleOrientation, { passive: true });
     window.addEventListener("deviceorientationabsolute", handleOrientation, { passive: true });
 
@@ -1660,6 +1754,10 @@ async function loadMLModules() {
     // Finish is durable BEFORE the label sheet; Skip still preserves the trip.
     await protectRecording(true);
     state.sync?.setRecording(false);
+    if (state.calibrationDeferred) {
+      state.calibrationDeferred = false;
+      await refreshForkCalibration();
+    }
     await updateTrainingStatus();
 
     hapticTick(8);
@@ -1691,7 +1789,7 @@ async function loadMLModules() {
     ui.recordBtn.disabled = false;
     ui.recordLabel.textContent = 'Start recording';
     ui.saveOneDriveBtn.disabled=!state.nativeSave?.supported();
-    await renderLocalRecordings();
+    await renderLocalRecordings().catch(showCloudError);
     window.dispatchEvent(new Event('brixton:idle'));
   }
 
@@ -1728,7 +1826,7 @@ async function loadMLModules() {
 
       try {
         const text = await file.text();
-        const json = JSON.parse(text);
+        const json = JSON.parse(text.replace(/^\uFEFF/, ''));
 
         const ml = await loadMLModules();
         await ensureTrainSet();
@@ -1736,6 +1834,7 @@ async function loadMLModules() {
         imported.fromJSON(json);
 
         const merged = state.trainSet.mergeFrom(imported);
+        await state.trainSet.restoreRawFrom(imported);
         // Restored examples may have been exported by an older feature
         // extractor; bring them onto the current definition immediately (not
         // just on next load) so the merged set is internally consistent —

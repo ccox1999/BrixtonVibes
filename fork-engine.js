@@ -52,7 +52,12 @@
  * this comparison repeatable. Notes below document earlier experiments;
  * they are not claims of measured junction location or track geometry.
  */
-export const FORK_ENGINE_VERSION = 6;
+/* v7 (8 November 2026): preserve the branch rule and confidence method.
+ * Require real clean trailing coverage, prevent brake holds during gap
+ * recovery, and ignore stale timestamps consistently in state and features.
+ * Frozen October fitting gets 3/4 new November trips; development 40/46.
+ */
+export const FORK_ENGINE_VERSION = 7;
 
 // Windows are relative to the arrival instant, in seconds before it.
 export const WIN_FINAL = [26.0, 10.0];
@@ -409,6 +414,33 @@ function validSensorSample(s) {
   return gravity>=6 && gravity<=13;
 }
 
+// Validate the actual trailing evidence as well as the newest sensor event.
+// A recovered brake hold must never reach back across a missing-data window.
+function validReadingWindow(samples, end, seconds = LIVE_YAW_TRAIL) {
+  if (!samples?.length || !Number.isFinite(end)) return false;
+  const start = end - seconds * 1000;
+  if (!Number.isFinite(samples[0]?.time) || samples[0].time > start) return false;
+  let low = 0, high = samples.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (samples[mid].time < start - 2000) low = mid + 1;
+    else high = mid;
+  }
+  let previous = null, count = 0;
+  for (let i = Math.max(0, low - 1); i < samples.length; i++) {
+    const s = samples[i];
+    if (!Number.isFinite(s?.time)) return false;
+    if (s.time > end) break;
+    if (previous !== null && s.time <= previous) continue;
+    if (s.time >= start) {
+      if (!validSensorSample(s) || (previous !== null && s.time - previous > 2000)) return false;
+      count++;
+    }
+    previous = s.time;
+  }
+  return count >= 64 && previous !== null && previous >= end - 2000;
+}
+
 /* ------------------------------------------------------------
    JUNCTION-ANCHORED EARLY VERDICT — TRIED AND REVERTED, do not re-add
    without re-reading this.
@@ -531,6 +563,13 @@ export function yawIntegral(samples, endT, backHi, backLo) {
   for (let i = start; i < samples.length; i++) {
     const s = samples[i];
     if (s.time > lo) break;
+    if (prevT !== null && s.time <= prevT) continue;
+    if (!validSensorSample(s)) {
+      // Restart the gravity filter after unavailable evidence, including its
+      // warm-up prefix. Never turn missing axes into a fictitious zero turn.
+      g = null; prevT = Number.isFinite(s.time) ? s.time : prevT; prevYaw = 0;
+      continue;
+    }
 
     const gv = [s.gx || 0, s.gy || 0, s.gz || 0];
     if (!g) {
@@ -585,11 +624,14 @@ export function magSkew(samples, endT, backHi, backLo) {
     else loIdx = mid + 1;
   }
 
-  let n = 0, sum = 0, sumSq = 0, sumCu = 0;
+  let n = 0, sum = 0, sumSq = 0, sumCu = 0, previousTime = null;
   const mags = [];
   for (let i = start; i < samples.length; i++) {
     const s = samples[i];
     if (s.time > lo) break;
+    if (previousTime !== null && s.time <= previousTime) continue;
+    previousTime = s.time;
+    if (![s.ax,s.ay,s.az].every(Number.isFinite)) return null;
     const m = Math.hypot(s.ax || 0, s.ay || 0, s.az || 0);
     mags.push(m);
     sum += m;
@@ -820,9 +862,7 @@ function measureTrip(ex) {
   if(!Number.isFinite(end)) return null;
   const cut = end - LIVE_CAL_LEAD * 1000;
   // Broken sensor windows are not labelled examples of a zero turn.
-  const window=raw.filter(s=>s.time>=cut-LIVE_YAW_TRAIL*1000 && s.time<=cut);
-  if(window.length<64 || window.some(s=>!validSensorSample(s))) return null;
-  for(let i=1;i<window.length;i++) if(window[i].time-window[i-1].time>2000) return null;
+  if (!validReadingWindow(raw, cut)) return null;
   return {
     left: ex.label === "left",
     yawFinal: yawIntegral(raw, end, WIN_FINAL[0], WIN_FINAL[1]),
@@ -934,11 +974,16 @@ export class ForkEngine {
    *          "early"       v1 yaw fallback before there is a calibration
    */
   update(s, all, computeVerdict = true) {
+    // Ignore stale events before inspecting their values: an invalid duplicate
+    // must not rewind the clock or destroy a newer, valid live reading.
+    if (Number.isFinite(s?.time) && this.lastSampleTime !== null && s.time <= this.lastSampleTime) return null;
     const valid = validSensorSample(s);
     const gap = valid && this.lastSampleTime!==null && s.time-this.lastSampleTime>2000;
     if (!valid || gap) {
       this.qualityReason = gap ? 'sensor-gap' : 'missing-sensors';
-      if (Number.isFinite(s?.time)) { this.invalidUntil=s.time+LIVE_YAW_TRAIL*1000; this.lastSampleTime=s.time; }
+      const lastKnown = Number.isFinite(s?.time) ? s.time : this.lastSampleTime;
+      if (lastKnown !== null) this.invalidUntil=lastKnown+LIVE_YAW_TRAIL*1000;
+      if (Number.isFinite(s?.time)) this.lastSampleTime=s.time;
       this.vib=[];
       this.frozen=false; this.frozenZ=null; this.lowSince=null; this.highSince=null; this.readAt=null;
       return computeVerdict ? {phase:'cleared',pLeft:.5,pRight:.5,prediction:null,score:0,
@@ -984,7 +1029,7 @@ export class ForkEngine {
     //
     // There is deliberately no ARRIVAL detector: the user taps Stop within
     // ~1 s of the halt, and a wait looks like an arrival until it ends.
-    if (this.armed && this.cruise) {
+    if (this.armed && this.cruise && t > this.invalidUntil) {
       if (!this.frozen) {
         if (rms < FREEZE_FRAC * this.cruise) {
           if (this.lowSince === null) this.lowSince = t;
@@ -1100,6 +1145,7 @@ export class ForkEngine {
  * @returns {number|null}  null if the skew window is too sparse
  */
 export function liveReadingAt(samples, t, cal) {
+  if (!cal?.liveYaw || !cal?.liveSkew || !validReadingWindow(samples, t)) return null;
   const { liveYaw: y, liveSkew: k } = cal;
   const sk = magSkew(samples, t, LIVE_SKEW_TRAIL, 0);
   if (sk === null) return null;
@@ -1125,6 +1171,7 @@ export function liveReadingAt(samples, t, cal) {
  *          what was on screen when Stop was tapped
  */
 export function replayDisplay(samples, cal) {
+  if (!samples?.length) return [];
   const engine = new ForkEngine(cal);
   const out = [];
   let shown = null;
@@ -1145,6 +1192,7 @@ export function replayDisplay(samples, cal) {
 
 /** What `replayDisplay` had on screen `lead` seconds before the end. */
 export function shownAt(timeline, lead) {
+  if (!timeline?.length || !Number.isFinite(lead)) return null;
   const cut = timeline[timeline.length - 1].t - lead * 1000;
   let rec = null;
   for (const r of timeline) { if (r.t <= cut) rec = r; else break; }

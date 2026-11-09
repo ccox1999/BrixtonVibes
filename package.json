@@ -7,7 +7,10 @@
     "test": "node --test tests/*.test.mjs onedrive-sync.test.mjs",
     "test:browser": "node tools/test-browser.mjs",
     "test:update": "node tools/test-update.mjs",
+    "test:journal": "node tools/test-journal.mjs",
+    "verify": "node tools/verify.mjs",
     "analyze": "node analyze-development.mjs",
+    "analyze:track-shape": "node tools/reconstruct-track-shape.mjs",
     "build:cloud": "node onedrive-worker/build-assets.mjs"
   },
   "devDependencies": {

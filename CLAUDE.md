@@ -1,5 +1,33 @@
 # BrixtonVibes — Project Context
 
+## November review — v43 / engine v7 (8 November 2026)
+
+The new 23L23R export has 46 distinct journeys: October's identical 42 plus four
+recorded 4–7 November. Frozen October calibration gets 3/4 new journeys correct;
+example-44 (5 November, left) is a genuine miss at roughly 60% right. All 46
+leave-one-journey-out scores are 40/46 at Finish, 36/46 at 12 s and 25/46 at 16 s.
+Version 7 correctness fixes preserve those direction counts, weighting and hold
+thresholds. No earlier reliable call or compass override has been demonstrated.
+Read docs/november-review.md and docs/november-algorithm-review.md for details.
+
+Interrupted-window recovery, stale/duplicate timestamps and incomplete reading
+windows are checked; legacy model metadata/nonfinite values are protected.
+Journal patches serialize their reads/writes; database failures recover; import
+conflicts and malformed raw rows reject before replacing history; deletion waits
+for metadata durability. UI calibration cannot change an active journey; compass
+expires; optional compass permission cannot block granted motion; late wake locks
+release; rescue downloads preserve the unsaved current recording; label sheet
+supports keyboard focus/Escape. Storage keys remain unchanged.
+
+The bundled track reference now aggregates 46 trips. Track observations require
+real temporal coverage; missing gravity is not zero. Experimental reconstruction
+anchors stops by actual frame timestamps, not compressed indexes after gaps.
+It remains research, not a physical map or live predictor. Raw exports and
+individual derived traces remain private. Native-only OneDrive is unchanged;
+no additional account or hosting was created. App release 43 deploys from
+`main` through the existing GitHub Pages site. `npm run verify` runs the complete
+local suite. Physical iPhone/OneDrive delivery remains unverified.
+
 ## Offline update repair — v42
 
 An actual iPhone still showed v38 after v41 deployed. A new worker/cache alone

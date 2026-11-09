@@ -1,21 +1,29 @@
 import fs from 'node:fs';
-import crypto from 'node:crypto';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildTrackReference, motionFrames, TrackPosition } from '../track-position.js';
+import { loadRecordings } from '../lib/recordings.mjs';
 
 const files = process.argv.slice(2).filter(x => !x.startsWith('--'));
 if (!files.length) throw new Error('Pass one or more private victoria-training exports. Optional --build writes aggregate reference.');
-const seen = new Set(), examples = [], snapshots = [];
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const { examples, duplicates } = loadRecordings(files);
+const snapshots = [], seen = new Set();
 for (const file of files) {
-  const data = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+  const { examples: entries } = loadRecordings([file]);
   let added = 0;
-  for (const e of data.examples || []) {
-    if (!['left', 'right'].includes(e.label) || !e.rawMotionData?.length || /fake/i.test(e.notes || '')) continue;
-    const hash = crypto.createHash('sha256').update(JSON.stringify(e.rawMotionData)).digest('hex');
-    if (!seen.has(hash)) { seen.add(hash); examples.push(e); added++; }
+  for (const e of entries) {
+    if (!seen.has(e.fingerprint)) { seen.add(e.fingerprint); added++; }
   }
-  snapshots.push({ file: file.split(/[\\/]/).at(-1), count: data.examples.length, uniqueAdded: added });
+  snapshots.push({ file: path.basename(file), count: entries.length, uniqueAdded: added });
 }
-for (const e of examples) e.frames = motionFrames(e.rawMotionData);
+if (examples.length < 7) throw new Error('At least seven distinct usable journeys are needed for leave-one-journey-out track validation.');
+for (const e of examples) {
+  e.frames = motionFrames(e.rawMotionData);
+  if (e.frames.filter(frame => frame.moving).length < 30) {
+    throw new Error(`Journey ${e.id || '(unnamed)'} has fewer than 30 usable moving seconds; track validation cannot score it.`);
+  }
+}
 const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
 const methods = ['moving-clock', 'unconstrained-nearest', 'filter-0', 'filter-0.06', 'filter-0.15'];
 const records = Object.fromEntries(methods.map(m => [m, []]));
@@ -102,9 +110,11 @@ for (let index = 0; index < examples.length; index++) {
   }
   deadReckoning.push({ distance, finalVelocity: velocity });
 }
-const chronologicalTrain = examples.filter(e => e.timestamp < Date.parse('2026-09-28'));
-const chronologicalTest = examples.filter(e => e.timestamp >= Date.parse('2026-09-28'));
+function chronologicalSplit(cutoff) {
+const chronologicalTrain = examples.filter(e => e.timestamp < Date.parse(cutoff));
+const chronologicalTest = examples.filter(e => e.timestamp >= Date.parse(cutoff));
 const chronologicalReference = buildTrackReference(chronologicalTrain);
+if (!chronologicalReference || !chronologicalTest.length) return { train: chronologicalTrain.length, test: chronologicalTest.length, cutoff, meanAbsoluteProxyError: null, movingClockMeanAbsoluteProxyError: null };
 const chronologicalRows = chronologicalTest.map(e => {
   const movingTotal = e.frames.filter(f => f.moving).length, tracker = new TrackPosition(chronologicalReference);
   const errors = [], clockErrors = [];
@@ -119,7 +129,11 @@ const chronologicalRows = chronologicalTest.map(e => {
   }
   return { match: mean(errors), clock: mean(clockErrors) };
 });
-const result = { generatedBy: 'node tools/analyze-track.mjs <snapshots> --build', trips: examples.length,
+return { train: chronologicalTrain.length, test: chronologicalTest.length, cutoff,
+  meanAbsoluteProxyError: mean(chronologicalRows.map(x => x.match)), movingClockMeanAbsoluteProxyError: mean(chronologicalRows.map(x => x.clock)),
+  caveat: 'Held-out reference split; sensor-quality corrections were developed during this review. This is an internal moving-fraction proxy, not physical position accuracy.' };
+}
+const result = { generatedBy: 'node tools/analyze-track.mjs <snapshots> --build', trips: examples.length, duplicates,
   validation: 'Leave-one-journey-out; proxy target is completed-journey moving-time fraction, NOT independently measured physical position.',
   snapshots,
   methods: Object.fromEntries(methods.map(m => [m, {
@@ -132,9 +146,8 @@ const result = { generatedBy: 'node tools/analyze-track.mjs <snapshots> --build'
   sampleLevelInserted30sStops: { trips: examples.length, maximumProgressDriftAfter2sSettling: rawPauseMaxDrift,
     maximumAdvanceDuringFirst2s: rawPauseWarmupAdvance, maximumEndProgressDifference: rawPauseEndDifference,
     caveat: 'First partial one-second observation can still include preceding movement. Boundary mixtures can slightly change movement classification after restarting; quiet dwell itself is excluded from cruise estimation.' },
-  chronological: { train: chronologicalTrain.length, test: chronologicalTest.length, cutoff: '2026-09-28',
-    meanAbsoluteProxyError: mean(chronologicalRows.map(x => x.match)), movingClockMeanAbsoluteProxyError: mean(chronologicalRows.map(x => x.clock)),
-    caveat: 'Filter was developed after seeing these recordings; this split excludes test journeys from its reference, not from engineering decisions.' },
+  chronological: chronologicalSplit('2026-09-28'),
+  november: chronologicalSplit('2026-10-31'),
   largestOneSecondCorrection: { forward: maximumForwardCorrection, backward: maximumBackwardCorrection },
   invalidFrameCount: gapCounts.reduce((a, b) => a + b, 0),
   naivePhonePlaneIntegration: { caveat: 'Uncorrected phone x/y PCA, arbitrary sign, assumes zero initial speed. A failure demonstration, not a track reconstruction.', distanceMin: Math.min(...deadReckoning.map(x => x.distance)), distanceMax: Math.max(...deadReckoning.map(x => x.distance)), finalVelocityMin: Math.min(...deadReckoning.map(x => x.finalVelocity)), finalVelocityMax: Math.max(...deadReckoning.map(x => x.finalVelocity)) }
@@ -142,6 +155,6 @@ const result = { generatedBy: 'node tools/analyze-track.mjs <snapshots> --build'
 console.log(JSON.stringify(result, null, 2));
 if (process.argv.includes('--build')) {
   const reference = buildTrackReference(examples);
-  fs.writeFileSync('track-reference.js', `// Generated aggregate; contains no raw trip samples or timestamps.\nexport const TRACK_REFERENCE = ${JSON.stringify(reference)};\n`);
-  fs.writeFileSync('docs/track-validation.json', JSON.stringify(result, null, 2) + '\n');
+  fs.writeFileSync(path.join(root, 'track-reference.js'), `// Generated aggregate; contains no raw trip samples or timestamps.\nexport const TRACK_REFERENCE = ${JSON.stringify(reference)};\n`);
+  fs.writeFileSync(path.join(root, 'docs/track-validation.json'), JSON.stringify(result, null, 2) + '\n');
 }
